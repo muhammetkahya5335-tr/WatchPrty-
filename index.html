@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Senkronize Video Odası</title>
+  <style>
+    /* Temiz ve modern arayüz */
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      background: #1a1a2e;
+      color: #e0e0e0;
+      height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .join-screen {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100%;
+    }
+    .join-form {
+      background: #2a2a3d;
+      padding: 40px;
+      border-radius: 12px;
+      box-shadow: 0 8px 20px rgba(0,0,0,0.5);
+      text-align: center;
+    }
+    .join-form h2 { margin-bottom: 20px; color: #fff; }
+    .join-form input {
+      display: block;
+      width: 100%;
+      margin: 10px 0;
+      padding: 12px;
+      border-radius: 6px;
+      border: 1px solid #444;
+      background: #3a3a4d;
+      color: #fff;
+      font-size: 16px;
+    }
+    #joinBtn {
+      width: 100%;
+      padding: 12px;
+      background: #6c63ff;
+      color: white;
+      border: none;
+      border-radius: 6px;
+      font-size: 16px;
+      cursor: pointer;
+    }
+    #joinBtn:hover { background: #5a52d5; }
+
+    .container {
+      display: none;
+      width: 100%;
+      max-width: 1400px;
+      height: 90vh;
+      margin: auto;
+      gap: 20px;
+      padding: 20px;
+    }
+    .player-section {
+      flex: 3;
+      display: flex;
+      flex-direction: column;
+    }
+    .video-wrapper {
+      background: #000;
+      border-radius: 12px;
+      overflow: hidden;
+      position: relative;
+      padding-top: 56.25%; /* 16:9 */
+    }
+    #videoContainer {
+      position: absolute;
+      top: 0; left: 0;
+      width: 100%;
+      height: 100%;
+    }
+    #videoContainer iframe,
+    #videoContainer video {
+      width: 100%;
+      height: 100%;
+      border: none;
+    }
+    .controls {
+      margin-top: 15px;
+      background: #2a2a3d;
+      padding: 12px;
+      border-radius: 8px;
+      display: none;
+      align-items: center;
+      gap: 10px;
+    }
+    .controls.active { display: flex; }
+    .controls button {
+      background: #4a4a6a;
+      border: none;
+      color: white;
+      padding: 8px 16px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 16px;
+    }
+    .seek-bar { flex: 1; }
+    .time-display { font-size: 14px; white-space: nowrap; }
+
+    .right-panel {
+      flex: 1;
+      min-width: 260px;
+      max-width: 320px;
+      background: #2a2a3d;
+      border-radius: 12px;
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 15px;
+      box-shadow: -2px 0 10px rgba(0,0,0,0.3);
+      overflow-y: auto;
+    }
+    .right-panel h2 { color: #fff; font-size: 20px; }
+    .playlist {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+    }
+    .playlist li {
+      padding: 10px;
+      background: #3a3a4d;
+      margin-bottom: 6px;
+      border-radius: 6px;
+      font-size: 14px;
+      word-break: break-all;
+    }
+    .playlist li.current {
+      background: #6c63ff;
+      font-weight: bold;
+    }
+    .input-group {
+      display: flex;
+      gap: 8px;
+      margin-top: auto;
+    }
+    .input-group input {
+      flex: 1;
+      padding: 10px;
+      border-radius: 6px;
+      border: 1px solid #444;
+      background: #3a3a4d;
+      color: #fff;
+    }
+    .input-group button {
+      background: #6c63ff;
+      border: none;
+      color: white;
+      padding: 10px 16px;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+  </style>
+</head>
+<body>
+  <!-- Katılma Ekranı -->
+  <div id="joinScreen" class="join-screen">
+    <div class="join-form">
+      <h2>🎬 Senkronize Video Odası</h2>
+      <input type="text" id="roomInput" placeholder="Oda Adı" />
+      <input type="text" id="usernameInput" placeholder="Kullanıcı Adınız" />
+      <button id="joinBtn">Odaya Katıl</button>
+    </div>
+  </div>
+
+  <!-- Ana Uygulama Arayüzü -->
+  <div id="app" class="container">
+    <div class="player-section">
+      <div class="video-wrapper">
+        <div id="videoContainer"></div>
+      </div>
+      <div class="controls" id="controls">
+        <button id="playPauseBtn">▶</button>
+        <input type="range" id="seekBar" class="seek-bar" min="0" max="100" value="0" step="0.1" />
+        <span class="time-display" id="timeDisplay">00:00 / 00:00</span>
+      </div>
+    </div>
+    <div class="right-panel">
+      <h2>📋 Oynatma Listesi</h2>
+      <ul class="playlist" id="playlist"></ul>
+      <div class="input-group" id="adminPanel" style="display: none;">
+        <input type="text" id="videoLinkInput" placeholder="YouTube / Drive linki" />
+        <button id="addBtn">Ekle</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="https://www.youtube.com/iframe_api"></script>
+  <script src="script.js"></script>
+</body>
+</html>

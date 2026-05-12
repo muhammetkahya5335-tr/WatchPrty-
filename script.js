@@ -109,7 +109,21 @@ function addVideoToRoom() {
     const url  = inp.value.trim();
     if (!url) return;
     const parsed = parseVideoUrl(url);
-    if (!parsed) { addSystemMsg('⚠️ Geçersiz link. Sadece YouTube veya Google Drive desteklenir.'); return; }
+    if (!parsed) {
+        // FIX: Hata mesajını hem sistem mesajı olarak yaz hem de
+        // playlist panelinde (input'un yanında) kısa bir uyarı göster —
+        // çünkü kullanıcı playlist sekmesindeyken chat-flow görünmez.
+        addSystemMsg('⚠️ Geçersiz link. Sadece YouTube veya Google Drive desteklenir.');
+        inp.style.borderColor = '#ff4444';
+        inp.placeholder = '⚠️ Geçersiz link! YouTube veya Drive girin.';
+        setTimeout(() => {
+            inp.style.borderColor = '';
+            inp.placeholder = 'YouTube veya Drive linki ekle...';
+        }, 3000);
+        return;
+    }
+    inp.style.borderColor = '';
+    inp.placeholder = 'YouTube veya Drive linki ekle...';
     const newList = [...roomPlaylist, url];
     db.ref('rooms/' + rCode + '/playlist').set(newList);
     inp.value = '';
@@ -259,6 +273,10 @@ function initApp() {
             roomRef.child('playlist').set(savedPlaylist);
             roomRef.child('sync').update({ videoId: savedPlaylist[0], time: 0, state: -1, playlistIndex: 0 });
             loadVideo(savedPlaylist[0], { time: 0, state: -1 });
+            // FIX: Oda başlatıldıktan sonra localStorage'ı temizle.
+            // Aksi takdirde sayfa yenilendiğinde eski playlist Firebase'deki
+            // mevcut (addVideoToRoom ile güncellenen) listeyi sıfırlar.
+            localStorage.removeItem('playlist');
         }
 
         setInterval(() => {

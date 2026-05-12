@@ -249,49 +249,98 @@ async function toggleMic() {
     }
 }
 
+// ── WebRTC: Presence & Signaling ─────────────────────────────────────────────
+// FIX 1: Presence yazıldıktan SONRA diğerlerini dinle (race condition önleme)
+// FIX 2: listenForSignals initApp'de çağrılıyor, burada tekrar çağırma
+// FIX 3: candidate'lar offer/answer'dan önce gelebilir → kuyrukla
+// FIX 4: ICE TURN sunucuları eklendi (NAT arkası cihazlar için)
+// FIX 5: handleOffer'da track ekleme setRemoteDescription'dan ÖNCE yapılıyor
+
+const ICE_SERVERS = {
+    iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: 'stun:stun2.l.google.com:19302' },
+        // Ücretsiz TURN — NAT arkası / mobil operatör ağları için şart
+        {
+            urls: 'turn:openrelay.metered.ca:80',
+            username: 'openrelayproject',
+            credential: 'openrelayproject'
+        },
+        {
+            urls: 'turn:openrelay.metered.ca:443',
+            username: 'openrelayproject',
+            credential: 'openrelayproject'
+        }
+    ]
+};
+
+// candidate'lar remote description gelmeden önce gelebilir, biriktir
+const pendingCandidates = {};
+
 function announcePresence() {
     const myRef = db.ref('rooms/' + rCode + '/voice/' + uName);
-    myRef.set({ online: true });
+    myRef.set({ online: true, ts: Date.now() });
     myRef.onDisconnect().remove();
 
-    // Odadaki diğer kullanıcılara offer gönder
+    // Presence yazıldıktan sonra odadaki herkese offer gönder
     db.ref('rooms/' + rCode + '/voice').once('value', snap => {
         snap.forEach(child => {
             const otherId = child.key;
             if (otherId !== uName) createOffer(otherId);
         });
     });
+
+    // Yeni gelen biri olursa onlara da offer gönder
+    db.ref('rooms/' + rCode + '/voice').on('child_added', snap => {
+        const otherId = snap.key;
+        if (otherId !== uName && !peers[otherId]) {
+            createOffer(otherId);
+        }
+    });
 }
 
 function createOffer(targetId) {
+    if (peers[targetId]) return; // zaten bağlı
     const pc = createPeerConnection(targetId);
-    pc.createOffer().then(offer => {
-        pc.setLocalDescription(offer);
-        db.ref('rooms/' + rCode + '/signals/' + targetId + '/' + uName).push({
-            type: 'offer', sdp: offer.sdp
-        });
-    });
+    pc.createOffer({ offerToReceiveAudio: true })
+        .then(offer => pc.setLocalDescription(offer))
+        .then(() => {
+            db.ref('rooms/' + rCode + '/signals/' + targetId + '/' + uName).push({
+                type: 'offer', sdp: pc.localDescription.sdp
+            });
+        })
+        .catch(e => console.error('createOffer hata:', e));
 }
 
 function listenForSignals() {
     db.ref('rooms/' + rCode + '/signals/' + uName).on('child_added', (snap) => {
         const fromId = snap.key;
-        snap.forEach(msgSnap => {
+        // Her yeni mesajı işle
+        snap.on('child_added', msgSnap => {
             const msg = msgSnap.val();
-            if (msg.type === 'offer') handleOffer(fromId, msg);
-            else if (msg.type === 'answer') handleAnswer(fromId, msg);
-            else if (msg.type === 'candidate') handleCandidate(fromId, msg);
+            if (!msg) return;
             msgSnap.ref.remove();
+
+            if (msg.type === 'offer')         handleOffer(fromId, msg);
+            else if (msg.type === 'answer')   handleAnswer(fromId, msg);
+            else if (msg.type === 'candidate') handleCandidate(fromId, msg);
         });
     });
 }
 
 function createPeerConnection(peerId) {
-    const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+    if (peers[peerId]) peers[peerId].close();
+    const pc = new RTCPeerConnection(ICE_SERVERS);
     peers[peerId] = pc;
+    pendingCandidates[peerId] = [];
 
-    if (localStream) localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+    // Kendi ses track'ini ekle (mikrofon açıksa)
+    if (localStream) {
+        localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+    }
 
+    // ICE candidate → Firebase'e gönder
     pc.onicecandidate = e => {
         if (e.candidate) {
             db.ref('rooms/' + rCode + '/signals/' + peerId + '/' + uName).push({
@@ -303,46 +352,86 @@ function createPeerConnection(peerId) {
         }
     };
 
+    pc.onconnectionstatechange = () => {
+        const s = pc.connectionState;
+        if (s === 'connected') appendMsg('', '🔊 ' + peerId + ' sesli bağlandı', true);
+        if (s === 'disconnected' || s === 'failed') {
+            appendMsg('', '🔇 ' + peerId + ' bağlantısı kesildi', true);
+            const a = document.getElementById('audio_' + peerId);
+            if (a) a.remove();
+            delete peers[peerId];
+        }
+    };
+
+    // Karşı tarafın sesi gelince <audio> elementine bağla
     pc.ontrack = e => {
         let audio = document.getElementById('audio_' + peerId);
         if (!audio) {
             audio = document.createElement('audio');
             audio.id = 'audio_' + peerId;
             audio.autoplay = true;
+            audio.playsInline = true;
             document.body.appendChild(audio);
         }
         audio.srcObject = e.streams[0];
-        addSystemMsg('🔊 ' + peerId + ' bağlandı');
+        // Mobil tarayıcıda autoplay bazen bloklanır, kullanıcı etkileşimi sonrası çal
+        audio.play().catch(() => {
+            document.addEventListener('touchstart', () => audio.play(), { once: true });
+            document.addEventListener('click',      () => audio.play(), { once: true });
+        });
     };
 
     return pc;
 }
 
-function handleOffer(fromId, msg) {
+async function handleOffer(fromId, msg) {
     const pc = createPeerConnection(fromId);
-    pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp }).then(() => {
-        if (localStream) localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
-        return pc.createAnswer();
-    }).then(answer => {
-        pc.setLocalDescription(answer);
-        db.ref('rooms/' + rCode + '/signals/' + fromId + '/' + uName).push({
-            type: 'answer', sdp: answer.sdp
+
+    // FIX: track ÖNCE ekle, sonra remoteDescription set et
+    if (localStream) {
+        localStream.getTracks().forEach(t => {
+            if (!pc.getSenders().find(s => s.track === t)) pc.addTrack(t, localStream);
         });
+    }
+
+    await pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
+
+    // Birikmiş candidate'leri uygula
+    for (const c of (pendingCandidates[fromId] || [])) {
+        await pc.addIceCandidate(new RTCIceCandidate(c)).catch(() => {});
+    }
+    pendingCandidates[fromId] = [];
+
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    db.ref('rooms/' + rCode + '/signals/' + fromId + '/' + uName).push({
+        type: 'answer', sdp: pc.localDescription.sdp
     });
 }
 
-function handleAnswer(fromId, msg) {
+async function handleAnswer(fromId, msg) {
     const pc = peers[fromId];
-    if (pc) pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp });
+    if (!pc) return;
+    await pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp });
+
+    // Birikmiş candidate'leri uygula
+    for (const c of (pendingCandidates[fromId] || [])) {
+        await pc.addIceCandidate(new RTCIceCandidate(c)).catch(() => {});
+    }
+    pendingCandidates[fromId] = [];
 }
 
-function handleCandidate(fromId, msg) {
+async function handleCandidate(fromId, msg) {
     const pc = peers[fromId];
-    if (pc) pc.addIceCandidate(new RTCIceCandidate({
-        candidate: msg.candidate,
-        sdpMid: msg.sdpMid,
-        sdpMLineIndex: msg.sdpMLineIndex
-    }));
+    const cand = { candidate: msg.candidate, sdpMid: msg.sdpMid, sdpMLineIndex: msg.sdpMLineIndex };
+
+    if (!pc || !pc.remoteDescription) {
+        // Remote description henüz gelmedi, biriktir
+        if (!pendingCandidates[fromId]) pendingCandidates[fromId] = [];
+        pendingCandidates[fromId].push(cand);
+    } else {
+        await pc.addIceCandidate(new RTCIceCandidate(cand)).catch(() => {});
+    }
 }
 
 // ── YARDIMCI ─────────────────────────────────────────────────────────────────

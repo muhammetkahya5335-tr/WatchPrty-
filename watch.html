@@ -393,26 +393,25 @@
         }
 
         // ── ROLE BAZLI UI ─────────────────────────────────────────────────────
-        // Bu kısım script.js yüklendikten sonra çalışır, role değişkeni script.js'den gelir
-        window.addEventListener('DOMContentLoaded', () => {
-            // role script.js'de tanımlı; DOMContentLoaded + script.js yüklendikten sonra çalışır
-            // Ancak güvenli olsun diye kısa timeout ile çağır
-            setTimeout(() => {
-                const r = (typeof role !== 'undefined') ? role : 'guest';
+        // FIX: role değişkenini script.js'e bağımlı olmadan, doğrudan URL'den oku.
+        // Önceki kodda DOMContentLoaded + setTimeout(50ms) + script.js bağımlılığı
+        // bir yarış koşulu (race condition) yaratıyordu: script.js henüz parse
+        // edilmeden önce 'role' undefined dönüyordu ve add-video-area hiç
+        // gösterilmiyordu; bu yüzden playlist'e video eklemek mümkün olmuyordu.
+        // Çözüm: URL parametresini watch.html içinde bağımsız olarak oku.
+        (function applyRoleUI() {
+            const urlRole = new URLSearchParams(window.location.search).get('role') || 'guest';
 
-                if (r === 'host') {
-                    // Host: video kontrolü aktif, overlay yok, playlist nav ve add-video göster
-                    document.getElementById('guest-overlay').style.display = 'none';
-                    document.getElementById('pl-nav-btns').style.display   = 'flex';
-                    document.getElementById('add-video-area').style.display = 'flex';
-                } else {
-                    // Guest: overlay aktif → YT player'a tıklama engeli
-                    document.getElementById('guest-overlay').style.display = 'block';
-                    document.getElementById('pl-nav-btns').style.display   = 'none';
-                    document.getElementById('add-video-area').style.display = 'none';
-                }
-            }, 50);
-        });
+            if (urlRole === 'host') {
+                document.getElementById('guest-overlay').style.display  = 'none';
+                document.getElementById('pl-nav-btns').style.display    = 'flex';
+                document.getElementById('add-video-area').style.display = 'flex';
+            } else {
+                document.getElementById('guest-overlay').style.display  = 'block';
+                document.getElementById('pl-nav-btns').style.display    = 'none';
+                document.getElementById('add-video-area').style.display = 'none';
+            }
+        })();
     </script>
 </body>
 </html>

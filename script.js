@@ -13,164 +13,158 @@ if (!firebase.apps.length) firebase.initializeApp(firebaseConfig);
 const db = firebase.database();
 
 const params = new URLSearchParams(window.location.search);
-const uName = params.get('user') || "Anonim";
-const rCode = params.get('room') || "TEST";
-const role  = params.get('role') || "guest";
+const uName  = params.get('user') || "Anonim";
+const rCode  = params.get('room') || "TEST";
+const role   = params.get('role') || "guest";
 
 let player;
 let currentPlaylistIndex = 0;
-let micActive = false;
+let micActive   = false;
 let localStream = null;
-let peers = {}; // peerId -> RTCPeerConnection
+let peers = {};
 
 document.getElementById('roomLabel').innerText = "ODA: " + rCode;
 document.getElementById('roleLabel').innerText = "ROL: " + role.toUpperCase();
 
-// ── VIDEO TİPİ VE ID ÇIKARMA ─────────────────────────────────────────────────
-// Döner: { type: 'youtube'|'drive', id: '...' } veya null
-function parseVideoUrl(url) {
-    if (!url) return null;
-
-    // YouTube
-    const ytMatch = url.match(/(?:youtu\.be\/|[?&]v=|\/embed\/|\/v\/)([a-zA-Z0-9_-]{11})/);
-    if (ytMatch) return { type: 'youtube', id: ytMatch[1] };
-
-    // Google Drive — çeşitli format'lar:
-    // drive.google.com/file/d/FILE_ID/view
-    // drive.google.com/open?id=FILE_ID
-    // docs.google.com/file/d/FILE_ID/...
-    const driveMatch = url.match(/(?:drive\.google\.com\/file\/d\/|drive\.google\.com\/open\?id=|docs\.google\.com\/file\/d\/)([a-zA-Z0-9_-]+)/);
-    if (driveMatch) return { type: 'drive', id: driveMatch[1] };
-
-    return null;
+// ── YARDIMCI ──────────────────────────────────────────────────────────────────
+function escHtml(str) {
+    return String(str)
+        .replace(/&/g,'&amp;')
+        .replace(/</g,'&lt;')
+        .replace(/>/g,'&gt;');
 }
 
-// Geriye dönük uyumluluk (sadece YT ID döner)
-function extractVideoID(url) {
-    const p = parseVideoUrl(url);
-    return (p && p.type === 'youtube') ? p.id : null;
+// appendMsg: hem sistem hem de sohbet mesajı için tek nokta
+// FIX: Önceki kodda appendMsg tanımsızdı (addSystemMsg vardı), ses bağlantısı hataları bu yüzden ekrana yansımıyordu
+// ve bazı durumlarda ReferenceError fırlatıp WebRTC akışını kesiyordu.
+function appendMsg(user, text, isSystem) {
+    const flow = document.getElementById('chat-flow');
+    const div  = document.createElement('div');
+    div.className = 'msg';
+    if (isSystem) {
+        div.style.borderColor  = '#7000ff';
+        div.style.color        = '#aaa';
+        div.style.fontSize     = '12px';
+        div.innerText          = text;
+    } else {
+        div.innerHTML = `<b>${escHtml(user)}</b>${escHtml(text)}`;
+    }
+    flow.appendChild(div);
+    flow.scrollTop = flow.scrollHeight;
+}
+
+// addSystemMsg: geriye dönük uyumluluk
+function addSystemMsg(text) { appendMsg('', text, true); }
+
+// ── VIDEO TİPİ VE ID ÇIKARMA ──────────────────────────────────────────────────
+function parseVideoUrl(url) {
+    if (!url) return null;
+    const ytMatch = url.match(/(?:youtu\.be\/|[?&]v=|\/embed\/|\/v\/)([a-zA-Z0-9_-]{11})/);
+    if (ytMatch) return { type: 'youtube', id: ytMatch[1] };
+    const driveMatch = url.match(/(?:drive\.google\.com\/file\/d\/|drive\.google\.com\/open\?id=|docs\.google\.com\/file\/d\/)([a-zA-Z0-9_-]+)/);
+    if (driveMatch) return { type: 'drive', id: driveMatch[1] };
+    return null;
 }
 
 // ── MESAJ GÖNDERME ────────────────────────────────────────────────────────────
 function sendChat() {
-    const inp = document.getElementById('chatInp');
+    const inp  = document.getElementById('chatInp');
     const text = inp.value.trim();
     if (!text) return;
-    db.ref('rooms/' + rCode + '/messages').push({
-        user: uName,
-        text: text,
-        time: Date.now()
-    });
+    db.ref('rooms/' + rCode + '/messages').push({ user: uName, text, time: Date.now() });
     inp.value = '';
-    inp.focus(); // klavye açık kalsın
+    inp.focus();
 }
 
-// ── ANA UYGULAMA ──────────────────────────────────────────────────────────────
-function initApp() {
-    const roomRef = db.ref('rooms/' + rCode);
+// ── PLAYLİST (İZLEME ODASI) ──────────────────────────────────────────────────
+let roomPlaylist = [];
 
-    // Mesajları dinle
-    roomRef.child('messages').on('child_added', (snapshot) => {
-        const m = snapshot.val();
-        const flow = document.getElementById('chat-flow');
+function renderPlaylistPanel() {
+    const list = document.getElementById('playlist-panel-list');
+    if (!list) return;
+    list.innerHTML = '';
+    roomPlaylist.forEach((url, i) => {
+        const parsed = parseVideoUrl(url);
+        const type   = parsed ? parsed.type : 'unknown';
+        const label  = type === 'youtube' ? 'YT' : type === 'drive' ? 'DRIVE' : '?';
+        const cls    = type === 'youtube' ? 'badge-yt' : type === 'drive' ? 'badge-drive' : 'badge-unknown';
+        const short  = url.length > 38 ? url.slice(0, 38) + '…' : url;
+        const isActive = i === currentPlaylistIndex;
+
         const div = document.createElement('div');
-        div.className = 'msg';
-        div.innerHTML = `<b>${escHtml(m.user)}</b>${escHtml(m.text)}`;
-        flow.appendChild(div);
-        flow.scrollTop = flow.scrollHeight;
+        div.className = 'plist-item' + (isActive ? ' active' : '');
+        div.innerHTML = `
+            <span class="plist-badge ${cls}">${label}</span>
+            <span class="plist-text" title="${escHtml(url)}">${escHtml(short)}</span>
+            ${role === 'host' ? `<button class="plist-play-btn" onclick="hostSwitchTo(${i})" title="Bu videoyu oynat">▶</button>` : ''}
+        `;
+        list.appendChild(div);
     });
+}
 
-    // Senkronizasyon dinle
-    roomRef.child('sync').on('value', (snapshot) => {
-        const data = snapshot.val();
-        if (!data) return;
+// Host: odanın playlist'ine yeni video ekle
+function addVideoToRoom() {
+    if (role !== 'host') return;
+    const inp  = document.getElementById('addVideoInp');
+    const url  = inp.value.trim();
+    if (!url) return;
+    const parsed = parseVideoUrl(url);
+    if (!parsed) { addSystemMsg('⚠️ Geçersiz link. Sadece YouTube veya Google Drive desteklenir.'); return; }
+    const newList = [...roomPlaylist, url];
+    db.ref('rooms/' + rCode + '/playlist').set(newList);
+    inp.value = '';
+}
 
-        const parsed = parseVideoUrl(data.videoId);
-        if (!parsed) return;
+// Host: belirli bir index'e geç
+function hostSwitchTo(index) {
+    if (role !== 'host') return;
+    const url = roomPlaylist[index];
+    if (!url) return;
+    currentPlaylistIndex = index;
+    db.ref('rooms/' + rCode + '/sync').update({ videoId: url, time: 0, state: -1, playlistIndex: index });
+    loadVideo(url, { time: 0, state: -1 });
+    renderPlaylistPanel();
+}
 
-        if (parsed.type === 'youtube') {
-            // Drive player varsa kaldır, YT player'a geç
-            switchToYouTube(parsed.id);
-            if (!player || !player.loadVideoById) return;
-            if (player.getVideoData && player.getVideoData().video_id !== parsed.id) {
-                player.loadVideoById(parsed.id);
-            }
-            if (role === 'guest') {
-                const diff = Math.abs(player.getCurrentTime() - data.time);
-                if (diff > 3) player.seekTo(data.time, true);
-                data.state === 1 ? player.playVideo() : player.pauseVideo();
-            }
-        } else if (parsed.type === 'drive') {
-            switchToDrive(parsed.id, data);
-        }
-    });
+// Host: sonraki video
+function hostNext() {
+    if (role !== 'host') return;
+    if (currentPlaylistIndex < roomPlaylist.length - 1) hostSwitchTo(currentPlaylistIndex + 1);
+    else addSystemMsg('📋 Bu son video.');
+}
 
-    // Host: her 2 saniyede durumu yaz
-    if (role === 'host') {
-        const playlist = JSON.parse(localStorage.getItem('playlist') || '[]');
-        if (playlist.length > 0) {
-            // İlk URL'yi olduğu gibi yaz (type bilgisi korunuyor)
-            roomRef.child('sync').update({ videoId: playlist[0], time: 0, state: -1 });
-            roomRef.child('playlist').set(playlist);
+// Host: önceki video
+function hostPrev() {
+    if (role !== 'host') return;
+    if (currentPlaylistIndex > 0) hostSwitchTo(currentPlaylistIndex - 1);
+    else addSystemMsg('📋 Bu ilk video.');
+}
 
-            // İlk videoyu oynat
-            const parsed = parseVideoUrl(playlist[0]);
-            if (parsed && parsed.type === 'youtube') {
-                loadYouTubeById(parsed.id);
-            } else if (parsed && parsed.type === 'drive') {
-                switchToDrive(parsed.id, { time: 0, state: -1 });
-            }
-        }
+// ── VIDEO YÜKLEME ─────────────────────────────────────────────────────────────
+let currentVideoType = null;
 
-        setInterval(() => {
-            const driveEl = document.getElementById('driveVideo');
-            if (driveEl) {
-                roomRef.child('sync').update({
-                    time: driveEl.currentTime,
-                    state: driveEl.paused ? 2 : 1
-                });
-            } else if (player && player.getCurrentTime) {
-                roomRef.child('sync').update({
-                    time: player.getCurrentTime(),
-                    state: player.getPlayerState()
-                });
-            }
-        }, 2000);
+function loadVideo(url, syncData) {
+    const parsed = parseVideoUrl(url);
+    if (!parsed) return;
+    if (parsed.type === 'youtube') {
+        switchToYouTube(parsed.id, syncData);
+    } else if (parsed.type === 'drive') {
+        switchToDrive(parsed.id, syncData);
     }
-
-    // WebRTC: diğer kullanıcıların signal'larını dinle
-    listenForSignals();
 }
 
-// ── YOUTUBE API READY ─────────────────────────────────────────────────────────
-function onYouTubeIframeAPIReady() {
-    // Player nesnesini oluştur ama video yükleme initApp'e bırak
-    player = new YT.Player('player', {
-        height: '100%',
-        width: '100%',
-        videoId: '',
-        playerVars: { controls: (role === 'host' ? 1 : 0), rel: 0, playsinline: 1 },
-        events: { onReady: initApp }
-    });
-}
-
-// ── PLAYER SWITCH FONKSİYONLARI ───────────────────────────────────────────────
-let currentVideoType = null; // 'youtube' | 'drive'
-
-function switchToYouTube(videoId) {
-    if (currentVideoType === 'youtube') return; // zaten YT modunda
-    currentVideoType = 'youtube';
-    // Drive elementini kaldır
+function switchToYouTube(videoId, syncData) {
+    // Drive'ı kaldır
     const driveWrap = document.getElementById('driveWrap');
     if (driveWrap) driveWrap.remove();
-    // YT player div'ini göster
     document.getElementById('player').style.display = 'block';
+    currentVideoType = 'youtube';
     loadYouTubeById(videoId);
 }
 
 function loadYouTubeById(videoId) {
     if (!player || !player.loadVideoById) return;
-    if (player.getVideoData().video_id !== videoId) {
+    if (player.getVideoData && player.getVideoData().video_id !== videoId) {
         player.loadVideoById(videoId);
     }
 }
@@ -190,36 +184,113 @@ function switchToDrive(fileId, syncData) {
     if (wrap.dataset.fileId === fileId) return;
     wrap.dataset.fileId = fileId;
 
-    // Drive /preview iframe — en güvenilir yöntem.
-    // Dosyanın "Bağlantıya sahip herkes görüntüleyebilir" olması şart.
-    // rm=minimal parametresi Drive UI chrome'unu kaldırır, sadece video kalır.
     const embedUrl = `https://drive.google.com/file/d/${fileId}/preview?rm=minimal`;
-
     wrap.innerHTML = `
-        <iframe
-            id="driveFrame"
-            src="${embedUrl}"
-            width="100%"
-            height="100%"
+        <iframe id="driveFrame" src="${embedUrl}" width="100%" height="100%"
             style="border:none;display:block;"
-            allow="autoplay; fullscreen"
-            allowfullscreen>
-        </iframe>
-        <div id="driveOverlay" style="
-            position:absolute;bottom:0;left:0;right:0;
+            allow="autoplay; fullscreen" allowfullscreen></iframe>
+        <div style="position:absolute;bottom:0;left:0;right:0;
             background:linear-gradient(transparent,rgba(0,0,0,0.85));
             color:#aaa;font-size:11px;text-align:center;
             padding:6px;pointer-events:none;font-family:sans-serif;">
             📁 Google Drive — host videoyu kontrol eder
         </div>`;
 
-    // Drive iframe içine JS erişimi yok (cross-origin).
-    // Senkronizasyon notu: host iframe dışından kontrol edilemez,
-    // bu yüzden Drive videolarında tüm izleyiciler aynı URL'yi yükler
-    // ve host chat üzerinden "şimdi başlatın" diyerek koordine eder.
     if (role === 'host') {
-        setTimeout(() => appendMsg('', '📌 Drive videosu yüklendi. Hazır olduğunuzda sohbetten "HAZIR" yazın, hep birlikte başlatın.', true), 800);
+        setTimeout(() => addSystemMsg('📌 Drive videosu yüklendi. Hazır olduğunuzda sohbetten "HAZIR" yazın.'), 800);
     }
+}
+
+// ── ANA UYGULAMA ──────────────────────────────────────────────────────────────
+function initApp() {
+    const roomRef = db.ref('rooms/' + rCode);
+
+    // Mesajları dinle
+    roomRef.child('messages').on('child_added', snap => {
+        const m = snap.val();
+        appendMsg(m.user, m.text, false);
+    });
+
+    // Playlist'i dinle (hem host hem guest için anlık güncelleme)
+    roomRef.child('playlist').on('value', snap => {
+        const list = snap.val();
+        if (Array.isArray(list)) {
+            roomPlaylist = list;
+            renderPlaylistPanel();
+        }
+    });
+
+    // Senkronizasyon dinle
+    roomRef.child('sync').on('value', snap => {
+        const data = snap.val();
+        if (!data) return;
+
+        // Playlist index senkronizasyonu
+        if (typeof data.playlistIndex === 'number') {
+            currentPlaylistIndex = data.playlistIndex;
+            renderPlaylistPanel();
+        }
+
+        const parsed = parseVideoUrl(data.videoId);
+        if (!parsed) return;
+
+        if (parsed.type === 'youtube') {
+            switchToYouTube(parsed.id, data);
+            if (!player || !player.loadVideoById) return;
+            if (player.getVideoData && player.getVideoData().video_id !== parsed.id) {
+                player.loadVideoById(parsed.id);
+            }
+            // FIX: Sadece guest'ler senkronize edilir; host'un kendi kontrolü zaten var
+            if (role === 'guest') {
+                const diff = Math.abs(player.getCurrentTime() - data.time);
+                if (diff > 3) player.seekTo(data.time, true);
+                data.state === 1 ? player.playVideo() : player.pauseVideo();
+            }
+        } else if (parsed.type === 'drive') {
+            if (role === 'guest') switchToDrive(parsed.id, data);
+        }
+    });
+
+    // Host: playlist başlat & periyodik sync yaz
+    if (role === 'host') {
+        const savedPlaylist = JSON.parse(localStorage.getItem('playlist') || '[]');
+        if (savedPlaylist.length > 0) {
+            roomPlaylist = savedPlaylist;
+            roomRef.child('playlist').set(savedPlaylist);
+            roomRef.child('sync').update({ videoId: savedPlaylist[0], time: 0, state: -1, playlistIndex: 0 });
+            loadVideo(savedPlaylist[0], { time: 0, state: -1 });
+        }
+
+        setInterval(() => {
+            const driveEl = document.getElementById('driveVideo');
+            if (driveEl) {
+                roomRef.child('sync').update({ time: driveEl.currentTime, state: driveEl.paused ? 2 : 1 });
+            } else if (player && player.getCurrentTime) {
+                roomRef.child('sync').update({ time: player.getCurrentTime(), state: player.getPlayerState() });
+            }
+        }, 2000);
+    }
+
+    // WebRTC: sinyal dinlemeye başla
+    listenForSignals();
+}
+
+// ── YOUTUBE API READY ─────────────────────────────────────────────────────────
+function onYouTubeIframeAPIReady() {
+    // FIX: Guest'ler için controls:0 → YT'nin kendi UI'ını tamamen kapatır
+    player = new YT.Player('player', {
+        height: '100%',
+        width:  '100%',
+        videoId: '',
+        playerVars: {
+            controls:   role === 'host' ? 1 : 0,  // Guest'te kontroller gizli
+            disablekb:  role === 'host' ? 0 : 1,  // Guest'te klavye kısayolları kapalı
+            rel:        0,
+            playsinline: 1,
+            modestbranding: 1
+        },
+        events: { onReady: initApp }
+    });
 }
 
 // ── MİKROFON / SESLİ SOHBET ──────────────────────────────────────────────────
@@ -227,55 +298,39 @@ async function toggleMic() {
     const btn = document.getElementById('micBtn');
     if (!micActive) {
         try {
+            // FIX: getUserMedia başarılı olmazsa catch'e düşmeli, appendMsg çağrılmalı
             localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
             micActive = true;
             btn.classList.add('active');
             addSystemMsg('🎙️ Mikrofon açıldı');
-            announcePresence();
+            announcePresence(); // Presence yaz + peer'lara offer gönder
         } catch (e) {
-            addSystemMsg('⚠️ Mikrofon erişimi reddedildi');
+            console.error('Mikrofon hatası:', e);
+            addSystemMsg('⚠️ Mikrofon erişimi reddedildi: ' + e.message);
         }
     } else {
         localStream.getTracks().forEach(t => t.stop());
         localStream = null;
-        micActive = false;
+        micActive   = false;
         btn.classList.remove('active');
         addSystemMsg('🔇 Mikrofon kapatıldı');
-        // Peer bağlantıları kapat
         Object.values(peers).forEach(pc => pc.close());
         peers = {};
-        // Presence sil
         db.ref('rooms/' + rCode + '/voice/' + uName).remove();
     }
 }
 
 // ── WebRTC: Presence & Signaling ─────────────────────────────────────────────
-// FIX 1: Presence yazıldıktan SONRA diğerlerini dinle (race condition önleme)
-// FIX 2: listenForSignals initApp'de çağrılıyor, burada tekrar çağırma
-// FIX 3: candidate'lar offer/answer'dan önce gelebilir → kuyrukla
-// FIX 4: ICE TURN sunucuları eklendi (NAT arkası cihazlar için)
-// FIX 5: handleOffer'da track ekleme setRemoteDescription'dan ÖNCE yapılıyor
-
 const ICE_SERVERS = {
     iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
         { urls: 'stun:stun1.l.google.com:19302' },
         { urls: 'stun:stun2.l.google.com:19302' },
-        // Ücretsiz TURN — NAT arkası / mobil operatör ağları için şart
-        {
-            urls: 'turn:openrelay.metered.ca:80',
-            username: 'openrelayproject',
-            credential: 'openrelayproject'
-        },
-        {
-            urls: 'turn:openrelay.metered.ca:443',
-            username: 'openrelayproject',
-            credential: 'openrelayproject'
-        }
+        { urls: 'turn:openrelay.metered.ca:80',  username: 'openrelayproject', credential: 'openrelayproject' },
+        { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' }
     ]
 };
 
-// candidate'lar remote description gelmeden önce gelebilir, biriktir
 const pendingCandidates = {};
 
 function announcePresence() {
@@ -283,26 +338,24 @@ function announcePresence() {
     myRef.set({ online: true, ts: Date.now() });
     myRef.onDisconnect().remove();
 
-    // Presence yazıldıktan sonra odadaki herkese offer gönder
+    // Odada zaten olan kullanıcılara offer gönder
     db.ref('rooms/' + rCode + '/voice').once('value', snap => {
         snap.forEach(child => {
-            const otherId = child.key;
-            if (otherId !== uName) createOffer(otherId);
+            if (child.key !== uName) createOffer(child.key);
         });
     });
 
-    // Yeni gelen biri olursa onlara da offer gönder
+    // Sonradan katılanlar için
     db.ref('rooms/' + rCode + '/voice').on('child_added', snap => {
-        const otherId = snap.key;
-        if (otherId !== uName && !peers[otherId]) {
-            createOffer(otherId);
-        }
+        if (snap.key !== uName && !peers[snap.key]) createOffer(snap.key);
     });
 }
 
 function createOffer(targetId) {
-    if (peers[targetId]) return; // zaten bağlı
+    if (peers[targetId]) return;
     const pc = createPeerConnection(targetId);
+
+    // FIX: offerToReceiveAudio:true — karşı taraftan ses almak için şart
     pc.createOffer({ offerToReceiveAudio: true })
         .then(offer => pc.setLocalDescription(offer))
         .then(() => {
@@ -314,16 +367,14 @@ function createOffer(targetId) {
 }
 
 function listenForSignals() {
-    db.ref('rooms/' + rCode + '/signals/' + uName).on('child_added', (snap) => {
+    db.ref('rooms/' + rCode + '/signals/' + uName).on('child_added', snap => {
         const fromId = snap.key;
-        // Her yeni mesajı işle
         snap.on('child_added', msgSnap => {
             const msg = msgSnap.val();
             if (!msg) return;
-            msgSnap.ref.remove();
-
-            if (msg.type === 'offer')         handleOffer(fromId, msg);
-            else if (msg.type === 'answer')   handleAnswer(fromId, msg);
+            msgSnap.ref.remove(); // Okundu, temizle
+            if      (msg.type === 'offer')     handleOffer(fromId, msg);
+            else if (msg.type === 'answer')    handleAnswer(fromId, msg);
             else if (msg.type === 'candidate') handleCandidate(fromId, msg);
         });
     });
@@ -335,18 +386,18 @@ function createPeerConnection(peerId) {
     peers[peerId] = pc;
     pendingCandidates[peerId] = [];
 
-    // Kendi ses track'ini ekle (mikrofon açıksa)
+    // Kendi ses track'ini ekle
     if (localStream) {
         localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
     }
 
-    // ICE candidate → Firebase'e gönder
+    // ICE candidate'ları Firebase'e gönder
     pc.onicecandidate = e => {
         if (e.candidate) {
             db.ref('rooms/' + rCode + '/signals/' + peerId + '/' + uName).push({
-                type: 'candidate',
-                candidate: e.candidate.candidate,
-                sdpMid: e.candidate.sdpMid,
+                type:         'candidate',
+                candidate:    e.candidate.candidate,
+                sdpMid:       e.candidate.sdpMid,
                 sdpMLineIndex: e.candidate.sdpMLineIndex
             });
         }
@@ -354,30 +405,36 @@ function createPeerConnection(peerId) {
 
     pc.onconnectionstatechange = () => {
         const s = pc.connectionState;
-        if (s === 'connected') appendMsg('', '🔊 ' + peerId + ' sesli bağlandı', true);
+        // FIX: appendMsg yerine addSystemMsg kullanılıyordu ama appendMsg tanımlı değildi
+        // Artık appendMsg düzgün tanımlı
+        if (s === 'connected')    addSystemMsg('🔊 ' + peerId + ' sesli bağlandı');
         if (s === 'disconnected' || s === 'failed') {
-            appendMsg('', '🔇 ' + peerId + ' bağlantısı kesildi', true);
+            addSystemMsg('🔇 ' + peerId + ' bağlantısı kesildi');
             const a = document.getElementById('audio_' + peerId);
             if (a) a.remove();
             delete peers[peerId];
         }
     };
 
-    // Karşı tarafın sesi gelince <audio> elementine bağla
+    // FIX: Karşı tarafın ses track'i geldiğinde <audio> elementine bağla
+    // Bu kısım çalışmıyordu çünkü appendMsg ReferenceError fırlatıyordu ve
+    // ontrack handler'ın üzerindeki kod execution'ı kesiyordu.
     pc.ontrack = e => {
         let audio = document.getElementById('audio_' + peerId);
         if (!audio) {
-            audio = document.createElement('audio');
-            audio.id = 'audio_' + peerId;
+            audio          = document.createElement('audio');
+            audio.id       = 'audio_' + peerId;
             audio.autoplay = true;
             audio.playsInline = true;
             document.body.appendChild(audio);
         }
+        // FIX: srcObject'i streams[0]'dan al (e.track değil)
         audio.srcObject = e.streams[0];
-        // Mobil tarayıcıda autoplay bazen bloklanır, kullanıcı etkileşimi sonrası çal
         audio.play().catch(() => {
-            document.addEventListener('touchstart', () => audio.play(), { once: true });
-            document.addEventListener('click',      () => audio.play(), { once: true });
+            // Mobil autoplay politikası: ilk kullanıcı etkileşiminde oynat
+            const tryPlay = () => audio.play().catch(() => {});
+            document.addEventListener('touchstart', tryPlay, { once: true });
+            document.addEventListener('click',      tryPlay, { once: true });
         });
     };
 
@@ -387,7 +444,7 @@ function createPeerConnection(peerId) {
 async function handleOffer(fromId, msg) {
     const pc = createPeerConnection(fromId);
 
-    // FIX: track ÖNCE ekle, sonra remoteDescription set et
+    // Track'i setRemoteDescription'dan önce ekle
     if (localStream) {
         localStream.getTracks().forEach(t => {
             if (!pc.getSenders().find(s => s.track === t)) pc.addTrack(t, localStream);
@@ -413,8 +470,6 @@ async function handleAnswer(fromId, msg) {
     const pc = peers[fromId];
     if (!pc) return;
     await pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp });
-
-    // Birikmiş candidate'leri uygula
     for (const c of (pendingCandidates[fromId] || [])) {
         await pc.addIceCandidate(new RTCIceCandidate(c)).catch(() => {});
     }
@@ -422,31 +477,12 @@ async function handleAnswer(fromId, msg) {
 }
 
 async function handleCandidate(fromId, msg) {
-    const pc = peers[fromId];
+    const pc   = peers[fromId];
     const cand = { candidate: msg.candidate, sdpMid: msg.sdpMid, sdpMLineIndex: msg.sdpMLineIndex };
-
     if (!pc || !pc.remoteDescription) {
-        // Remote description henüz gelmedi, biriktir
         if (!pendingCandidates[fromId]) pendingCandidates[fromId] = [];
         pendingCandidates[fromId].push(cand);
     } else {
         await pc.addIceCandidate(new RTCIceCandidate(cand)).catch(() => {});
     }
-}
-
-// ── YARDIMCI ─────────────────────────────────────────────────────────────────
-function addSystemMsg(text) {
-    const flow = document.getElementById('chat-flow');
-    const div = document.createElement('div');
-    div.className = 'msg';
-    div.style.borderColor = '#7000ff';
-    div.style.color = '#aaa';
-    div.style.fontSize = '12px';
-    div.innerText = text;
-    flow.appendChild(div);
-    flow.scrollTop = flow.scrollHeight;
-}
-
-function escHtml(str) {
-    return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }

@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>birlikte — film gecesi</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Sora:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="glow glow-a"></div>
+<div class="glow glow-b"></div>
+
+<div class="conn-indicator" id="connIndicator" title="Bağlantı durumu"></div>
+
+<!-- ===================== GİRİŞ EKRANI ===================== -->
+<main id="landingView" class="view landing-view">
+  <div class="landing-card">
+    <div class="brand">
+      <span class="brand-mark">●</span>
+      <h1>birlikte</h1>
+      <p class="brand-sub">aynı anda izleyin, aynı anda konuşun</p>
+    </div>
+
+    <label class="field-label" for="nameInput">İsmin</label>
+    <input id="nameInput" class="text-input" type="text" maxlength="20" placeholder="örn. Deniz" autocomplete="off">
+
+    <p class="error-text" id="landingError"></p>
+
+    <div class="choice-row">
+      <button class="choice-card" id="createRoomBtn">
+        <span class="choice-icon">＋</span>
+        <span class="choice-title">Oda Oluştur</span>
+        <span class="choice-sub">yeni bir kod üret</span>
+      </button>
+      <button class="choice-card" id="showJoinBtn">
+        <span class="choice-icon">↳</span>
+        <span class="choice-title">Odaya Katıl</span>
+        <span class="choice-sub">kodu olan girsin</span>
+      </button>
+    </div>
+
+    <div class="join-box hidden" id="joinBox">
+      <label class="field-label" for="joinCodeInput">Oda Kodu</label>
+      <input id="joinCodeInput" class="text-input code-input" type="text" maxlength="6" placeholder="AB3F9K" autocomplete="off">
+      <button class="btn-primary full" id="joinSubmitBtn">Katıl</button>
+    </div>
+
+    <p class="loading-text hidden" id="landingLoading">bir saniye…</p>
+  </div>
+</main>
+
+<!-- ===================== ODA EKRANI ===================== -->
+<main id="roomView" class="view room-view hidden">
+
+  <header class="room-header">
+    <div class="ticket" id="roomCodeTicket" title="Kopyalamak için tıkla">
+      <span class="ticket-label">ODA KODU</span>
+      <span class="ticket-perf"></span>
+      <span class="ticket-code" id="roomCodeText">——————</span>
+    </div>
+
+    <div class="presence-list" id="presenceList"></div>
+
+    <button class="btn-ghost" id="leaveRoomBtn">Çıkış</button>
+  </header>
+
+  <div class="room-layout">
+
+    <section class="player-section">
+      <div class="player-frame">
+        <button class="sticky-close" id="stickyCloseBtn" aria-label="Mini player'ı kapat">✕</button>
+        <div class="player-empty" id="playerEmpty">
+          <span>henüz video seçilmedi</span>
+          <span class="player-empty-sub">aşağıdan bir link ekleyin</span>
+        </div>
+        <div class="player-stage" id="playerStage">
+          <div id="ytHost"></div>
+          <video id="videoEl" playsinline></video>
+        </div>
+        <div class="reactions-layer" id="reactionsLayer"></div>
+        <div class="end-countdown hidden" id="endCountdown">
+          <div class="countdown-ring-wrap">
+            <svg class="countdown-ring" viewBox="0 0 64 64">
+              <circle class="countdown-ring-bg" cx="32" cy="32" r="28"></circle>
+              <circle class="countdown-ring-fg" id="countdownRingFg" cx="32" cy="32" r="28"></circle>
+            </svg>
+            <span class="countdown-number" id="countdownNumber">5</span>
+          </div>
+          <p class="countdown-text">saniye içinde sıradaki videoya geçiliyor…</p>
+          <button class="btn-ghost" id="countdownSkipBtn">Şimdi geç</button>
+        </div>
+      </div>
+      <div class="player-frame-placeholder" id="playerFramePlaceholder" aria-hidden="true"></div>
+
+      <div class="reaction-bar" id="reactionBar">
+        <button class="reaction-btn" data-emoji="😂" aria-label="Gülme tepkisi">😂</button>
+        <button class="reaction-btn" data-emoji="😱" aria-label="Şaşkınlık tepkisi">😱</button>
+        <button class="reaction-btn" data-emoji="❤️" aria-label="Kalp tepkisi">❤️</button>
+        <button class="reaction-btn" data-emoji="🍿" aria-label="Patlamış mısır tepkisi">🍿</button>
+        <button class="reaction-btn" data-emoji="👏" aria-label="Alkış tepkisi">👏</button>
+      </div>
+
+      <div class="control-bar" id="controlBar">
+        <button class="play-btn" id="playPauseBtn" aria-label="Oynat / Duraklat">
+          <span id="playIcon">▶</span>
+        </button>
+        <span class="time-text" id="currentTimeText">0:00</span>
+        <input type="range" id="seekRange" class="seek-range" min="0" max="100" value="0" step="0.1">
+        <span class="time-text" id="durationTimeText">0:00</span>
+      </div>
+
+      <div class="control-bar control-bar-extra" id="controlBarExtra">
+        <button class="tool-btn" id="forceSyncBtn" type="button" aria-label="Beni senkronize et" title="Beni Yakala — anlık senkronize et">🔄</button>
+        <select class="quality-select speed-select hidden" id="speedSelect" aria-label="Oynatma hızı" title="Oynatma hızı (herkeste senkron)">
+          <option value="1">1x</option>
+          <option value="1.25">1.25x</option>
+          <option value="1.5">1.5x</option>
+          <option value="2">2x</option>
+        </select>
+        <select class="quality-select hidden" id="qualitySelect" aria-label="Video kalitesi" title="Video kalitesi (sadece bu cihazda)">
+          <option value="default">Otomatik</option>
+          <option value="hd1080">1080p</option>
+          <option value="hd720">720p</option>
+          <option value="large">480p</option>
+          <option value="medium">360p</option>
+          <option value="small">240p</option>
+        </select>
+        <button class="tool-btn hidden" id="pipBtn" type="button" aria-label="Küçük pencerede izle" title="Resim içinde resim">⧉</button>
+        <button class="tool-btn" id="cinemaBtn" type="button" aria-label="Sinema modu" title="Sinema modu — ışıkları kapat">💡</button>
+      </div>
+    </section>
+
+    <aside class="sidebar">
+      <div class="tab-row">
+        <button class="tab-btn active" data-tab="queue" id="tabQueueBtn">Liste</button>
+        <button class="tab-btn" data-tab="history" id="tabHistoryBtn">Geçmiş</button>
+        <button class="tab-btn" data-tab="chat" id="tabChatBtn">Sohbet<span class="unread-dot hidden" id="chatUnreadDot"></span></button>
+      </div>
+
+      <div class="sidebar-panel" id="queuePanel">
+        <div class="add-link-row">
+          <input type="text" id="linkInput" class="text-input" placeholder="YouTube, Drive ya da video linki yapıştır">
+          <button class="add-btn" id="addLinkBtn" aria-label="Listeye ekle">+</button>
+        </div>
+        <p class="error-text" id="queueError"></p>
+        <ul class="queue-list" id="queueList"></ul>
+      </div>
+
+      <div class="sidebar-panel hidden" id="historyPanel">
+        <ul class="queue-list" id="historyList"></ul>
+      </div>
+
+      <div class="sidebar-panel hidden" id="chatPanel">
+        <div class="chat-messages" id="chatMessages"></div>
+        <div class="typing-indicator hidden" id="typingIndicator"></div>
+
+        <div class="sticker-picker hidden" id="stickerPicker">
+          <button class="sticker-item" data-emoji="❤️">❤️</button>
+          <button class="sticker-item" data-emoji="😍">😍</button>
+          <button class="sticker-item" data-emoji="🍿">🍿</button>
+          <button class="sticker-item" data-emoji="😂">😂</button>
+          <button class="sticker-item" data-emoji="😭">😭</button>
+          <button class="sticker-item" data-emoji="👏">👏</button>
+          <button class="sticker-item" data-emoji="🔥">🔥</button>
+          <button class="sticker-item" data-emoji="😱">😱</button>
+          <button class="sticker-item" data-emoji="😴">😴</button>
+          <button class="sticker-item" data-emoji="🥹">🥹</button>
+        </div>
+
+        <div class="chat-input-row">
+          <input type="text" id="chatInput" class="text-input" maxlength="500" placeholder="bir şey yaz…">
+          <input type="file" id="imageFileInput" accept="image/*" class="hidden">
+          <button class="tool-btn" id="imageBtn" type="button" aria-label="Resim ekle">🖼</button>
+          <button class="tool-btn" id="stickerBtn" type="button" aria-label="Çıkartma ekle">😊</button>
+          <button class="add-btn" id="sendChatBtn" aria-label="Gönder">↑</button>
+        </div>
+      </div>
+    </aside>
+
+  </div>
+</main>
+
+<div class="lightbox hidden" id="lightbox">
+  <img id="lightboxImg" src="" alt="büyütülmüş resim">
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-database-compat.js"></script>
+<script src="firebase-config.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

@@ -628,6 +628,8 @@ function loadPlayerForCurrentItem() {
     const src = item.type === 'drive' ? driveStreamUrl(item.refId) : item.refId;
     if (videoEl.src !== src) { videoEl.src = src; videoEl.load(); }
   }
+  /* Video yüklendi — mini player gerekip gerekmediğini kontrol et */
+  setTimeout(() => { if (window._stickyCheck) window._stickyCheck(); }, 100);
 }
 
 /* --- YouTube IFrame API --- */
@@ -689,22 +691,14 @@ el('videoEl').addEventListener('ended', handleVideoEnded);
   const placeholder   = el('playerFramePlaceholder');
   if (!playerSection || !playerFrame || !placeholder) return;
 
-  const MINI_W = Math.min(300, window.innerWidth - 28);
-  const MINI_H = Math.round(MINI_W * 9 / 16);
   const MARGIN = 14;
+  let posX = MARGIN, posY = MARGIN;
+  let stickyEnabled = true, isSticky = false;
 
-  let posX = MARGIN;
-  let posY = MARGIN;
-  let stickyEnabled = true;
-  let isSticky = false;
-
-  /* --- placeholder'ı player yüksekliğiyle eşitle --- */
   function syncPlaceholder() {
-    /* sticky olmadığında gerçek yüksekliği ölç */
-    placeholder.style.height = (playerFrame.offsetHeight || MINI_H) + 'px';
+    placeholder.style.height = playerFrame.offsetHeight + 'px';
   }
 
-  /* --- sticky aç --- */
   function enableSticky() {
     if (isSticky) return;
     isSticky = true;
@@ -713,91 +707,69 @@ el('videoEl').addEventListener('ended', handleVideoEnded);
     playerSection.classList.add('sticky-active');
   }
 
-  /* --- sticky kapat --- */
   function disableSticky() {
     if (!isSticky) return;
     isSticky = false;
     playerSection.classList.remove('sticky-active');
-    ['left','bottom','right','top','cursor','transition','width','height'].forEach(
-      (p) => playerFrame.style.removeProperty(p)
-    );
+    ['left','bottom','right','top','cursor','transition','width','height']
+      .forEach((p) => playerFrame.style.removeProperty(p));
   }
 
-  /* --- pozisyon uygula (sınır korumalı) --- */
   function applyPosition(x, y) {
-    /* boyutlar CSS'de sabit: 280x158 (küçük ekranda 230x130) */
-    const w = window.innerWidth  <= 360 ? 230 : 280;
-    const h = window.innerWidth  <= 360 ? 130 : 158;
-    const maxX = window.innerWidth  - w - MARGIN;
-    const maxY = window.innerHeight - h - MARGIN;
-    posX = Math.max(MARGIN, Math.min(x, maxX));
-    posY = Math.max(MARGIN, Math.min(y, maxY));
+    const w   = window.innerWidth <= 360 ? 230 : 280;
+    const h   = window.innerWidth <= 360 ? 130 : 158;
+    posX = Math.max(MARGIN, Math.min(x, window.innerWidth  - w - MARGIN));
+    posY = Math.max(MARGIN, Math.min(y, window.innerHeight - h - MARGIN));
     playerFrame.style.left   = posX + 'px';
     playerFrame.style.bottom = posY + 'px';
     playerFrame.style.right  = 'auto';
     playerFrame.style.top    = 'auto';
   }
 
-  /* =====================================================
-     SCROLL ile tespit — IntersectionObserver KULLANILMIYOR
-     Referans olarak HER ZAMAN akışta kalan elemanı kullan:
-       • isSticky=false → playerFrame (normal akışta)
-       • isSticky=true  → placeholder  (playerFrame'in yerini tutar)
-     Bu sayede feedback loop tamamen imkansız.
-     ===================================================== */
-  function onScroll() {
+  /* Scroll tespiti: sticky=false → frame rect, sticky=true → placeholder rect.
+     Hiçbiri asla aynı anda fixed olmuyor → feedback loop yok. */
+  function check() {
     if (!stickyEnabled) return;
     const hasVideo = el('playerStage').classList.contains('active');
-
     if (!isSticky) {
-      /* player frame hâlâ akışta — altta yoksa sticky yap */
-      const rect = playerFrame.getBoundingClientRect();
-      if (rect.bottom < 0 && hasVideo) enableSticky();
+      if (playerFrame.getBoundingClientRect().bottom < -10 && hasVideo) enableSticky();
     } else {
-      /* placeholder akışta, player fixed — placeholder görünürse sticky kapat */
-      const rect = placeholder.getBoundingClientRect();
-      if (rect.bottom > 20) disableSticky();
+      if (placeholder.getBoundingClientRect().bottom > 10) disableSticky();
     }
   }
+  window.addEventListener('scroll', check, { passive: true });
+  window.addEventListener('resize', () => { check(); if (isSticky) applyPosition(posX, posY); });
+  /* Video yüklenince de kontrol et (loadPlayerForCurrentItem çağrısından sonra tetiklenir) */
+  window._stickyCheck = check;
 
-  window.addEventListener('scroll', onScroll, { passive: true });
-  /* sayfa yüklenince de kontrol et (oda linkiyle başlayıp aşağıdaysa) */
-  window.addEventListener('load', onScroll);
-
-  /* --- Kapatma butonu --- */
   el('stickyCloseBtn').addEventListener('click', () => {
     disableSticky();
     stickyEnabled = false;
-    /* placeholder görünür alana girince tekrar etkinleştir */
-    function recheckOnScroll() {
-      const rect = playerFrame.getBoundingClientRect();
-      if (rect.bottom > 0) {
+    function recheckVisible() {
+      if (playerFrame.getBoundingClientRect().bottom > 0) {
         stickyEnabled = true;
-        window.removeEventListener('scroll', recheckOnScroll);
+        window.removeEventListener('scroll', recheckVisible);
       }
     }
-    window.addEventListener('scroll', recheckOnScroll, { passive: true });
+    window.addEventListener('scroll', recheckVisible, { passive: true });
   });
 
-  /* --- Sürükle-bırak --- */
+  /* Sürükle-bırak */
   let drag = null;
   playerFrame.addEventListener('pointerdown', (e) => {
     if (!isSticky) return;
-    if (e.target.closest('button, select, input')) return;
+    if (e.target.closest('button,select,input')) return;
     drag = { startPx: e.clientX, startPy: e.clientY, startX: posX, startY: posY };
     playerFrame.setPointerCapture(e.pointerId);
     playerFrame.style.cursor = 'grabbing';
     playerFrame.style.transition = 'none';
     e.preventDefault();
   });
-
   playerFrame.addEventListener('pointermove', (e) => {
     if (!drag) return;
-    const dx =  (e.clientX - drag.startPx);
-    const dy = -(e.clientY - drag.startPy); /* bottom-based koordinat */
-    applyPosition(drag.startX + dx, drag.startY + dy);
+    applyPosition(drag.startX + (e.clientX - drag.startPx),
+                  drag.startY - (e.clientY - drag.startPy));
   });
-
   const endDrag = () => {
     if (!drag) return;
     drag = null;
@@ -806,65 +778,107 @@ el('videoEl').addEventListener('ended', handleVideoEnded);
   };
   playerFrame.addEventListener('pointerup',     endDrag);
   playerFrame.addEventListener('pointercancel', endDrag);
-
-  window.addEventListener('resize', () => {
-    if (isSticky) applyPosition(posX, posY);
-  });
 })();
 
 /* =========================================================
-   OTOMATİK PİCTURE-IN-PICTURE — sekme/uygulama değişince
+   OTOMATİK PİCTURE-IN-PICTURE
+   Tarayıcı: visibilitychange anında PiP isteği reddedilebilir (kullanıcı
+   etkileşimi şartı). Bu yüzden önce mini player açık mı kontrol ediyoruz;
+   değilse PiP deneriz. YouTube iframe same-origin nedeniyle PiP yapılamaz.
    ========================================================= */
 document.addEventListener('visibilitychange', async () => {
   if (!document.hidden) return;
-  if (!state.isPlaying) return;
+  if (!state.isPlaying || !state.currentItemId) return;
 
   if (state.currentType === 'html5') {
     const v = el('videoEl');
-    if (!v || !v.src || document.pictureInPictureElement) return;
+    /* Zaten PiP'teyse veya PiP desteklenmiyorsa çık */
+    if (!v || !v.src || !v.readyState) return;
+    if (document.pictureInPictureElement) return;
     if (!document.pictureInPictureEnabled) return;
-    try { await v.requestPictureInPicture(); } catch (e) { /* kullanıcı izni gerektiriyor */ }
-  } else if (state.currentType === 'youtube') {
-    /* YouTube iframe same-origin kısıtı nedeniyle doğrudan PiP başlatılamaz.
-       Kullanıcıya bildir ve tarayıcının kendi PiP tuşuna yönlendir. */
-    if (!document.pictureInPictureElement) {
-      showToast('YouTube için: video üzerinde sağ tık → "Resim içinde resim"');
+    try {
+      await v.requestPictureInPicture();
+    } catch (e) {
+      /* Bazı tarayıcılar kullanıcı etkileşimi olmadan reddeder — sessizce geç */
     }
   }
+  /* YouTube: tarayıcı kendi PiP butonunu sunar, kod müdahale edemez */
+});
+
+/* PiP kapanınca sekme hâlâ arka plandaysa mini player aktif olsun */
+document.addEventListener('leavepictureinpicture', () => {
+  if (window._stickyCheck) window._stickyCheck();
 });
 
 /* =========================================================
-   TARAYICI BİLDİRİMLERİ — sekme arka plandayken mesaj gelince
+   TARAYICI BİLDİRİMLERİ
    ========================================================= */
-let notifPermission = Notification.permission;
+let notifPermission = ('Notification' in window) ? Notification.permission : 'denied';
 
 async function requestNotifPermission() {
+  if (!('Notification' in window)) return false;
   if (notifPermission === 'granted') return true;
   if (notifPermission === 'denied') return false;
-  notifPermission = await Notification.requestPermission();
+  try {
+    notifPermission = await Notification.requestPermission();
+  } catch (e) { return false; }
+  if (notifPermission !== 'granted') {
+    showToast('Bildirim izni verilmedi — tarayıcı ayarlarından açabilirsin');
+  }
   return notifPermission === 'granted';
 }
 
 function showChatNotification(senderName, text) {
-  if (notifPermission !== 'granted') return;
-  if (!document.hidden) return; // sekme görünürdeyse bildirim gerekmez
+  if (!('Notification' in window)) return;
+  if (notifPermission !== 'granted') {
+    /* İzin verilmemişse bir kez daha iste */
+    requestNotifPermission();
+    return;
+  }
+  if (!document.hidden) return;
   try {
-    const n = new Notification(`${senderName} · birlikte`, {
-      body: text && text.length > 80 ? text.slice(0, 80) + '…' : (text || '📷 Resim'),
+    const body = text
+      ? (text.length > 100 ? text.slice(0, 100) + '…' : text)
+      : '📷 Resim gönderdi';
+    const n = new Notification(`💬 ${senderName}`, {
+      body,
       icon: '/favicon.ico',
-      tag: 'birlikte-chat', // aynı tag → yeni mesaj eskinin üzerine yazar (bildirim yığılmaz)
+      badge: '/favicon.ico',
+      tag: 'birlikte-chat',
       renotify: true,
+      silent: false,
     });
     n.addEventListener('click', () => { window.focus(); n.close(); });
+    /* 8 saniye sonra otomatik kapat */
+    setTimeout(() => n.close(), 8000);
   } catch (e) {}
 }
 
-/* Service Worker kaydı — site kapalıyken bildirim almak için (HTTPS gerektirir).
-   sw.js dosyası projenin kök dizinine yerleştirilmeli.
-   FCM kurulumu yapılmadıysa servis worker sadece önbellek görevini üstlenir;
-   bildirimler yine de sekme açıkken/arka plandayken çalışır. */
+/* Service Worker — HTTPS ortamında site kapalıyken bildirim için.
+   updateViaCache:'none' → tarayıcı sw.js'i her zaman ağdan kontrol eder,
+   böylece yeni versiyon deploy edilince tüm cihazlar anında güncellenir. */
 if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.register('/sw.js').catch(() => {});
+  navigator.serviceWorker.register('/sw.js', { updateViaCache: 'none' })
+    .then((reg) => {
+      /* Yeni SW varsa hemen aktifleştir — kullanıcı yenileme beklemez */
+      reg.addEventListener('updatefound', () => {
+        const newSW = reg.installing;
+        if (!newSW) return;
+        newSW.addEventListener('statechange', () => {
+          if (newSW.state === 'installed' && navigator.serviceWorker.controller) {
+            /* Tüm sekmelere "skipWaiting" mesajı gönder */
+            newSW.postMessage({ type: 'SKIP_WAITING' });
+          }
+        });
+      });
+    })
+    .catch(() => {});
+
+  /* SW kontrolü değişince (yeni SW devreye girince) sayfayı yenile */
+  let refreshing = false;
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (!refreshing) { refreshing = true; window.location.reload(); }
+  });
 }
 
 /* --- Resim içinde resim (sadece HTML5 video) --- */
@@ -1348,9 +1362,14 @@ function spawnFlyingEmoji(emoji) {
    ========================================================= */
 function pushSystemMessage(text) {
   if (!state.roomCode) return;
+  /* Firebase kuralı name+text+sentAt zorunlu kılıyor;
+     sistem mesajları için sabit bir işaretleyici isim kullanılıyor */
   db.ref(`rooms/${state.roomCode}/chat`).push({
-    type: 'system', text, sentAt: firebase.database.ServerValue.TIMESTAMP,
-  }).catch((err) => console.error(err));
+    name: '🔔',        // validate kuralının "name" şartını karşılar
+    type: 'system',
+    text,
+    sentAt: firebase.database.ServerValue.TIMESTAMP,
+  }).catch((err) => console.error('system-msg write failed:', err));
 }
 
 function listenChat() {

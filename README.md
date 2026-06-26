@@ -86,5 +86,3 @@ hepsi statik dosya barındırıyor.
   denemeni öneririm.
 - YouTube'da bölgesel/yaş kısıtlı ya da "yerleştirmeye izin verilmeyen" videolar
   oynatılamaz (YouTube'un kendi kısıtlaması).
-
-

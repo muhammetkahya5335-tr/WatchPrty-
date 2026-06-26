@@ -1,57 +1,86 @@
 /* ============================================================
-   birlikte — Service Worker
-   Sekme kapalıyken bile bildirim almak için bu dosya projenin
-   kök dizininde (index.html ile aynı yerde) bulunmalıdır.
-   HTTPS ortamında otomatik olarak kaydedilir.
+   birlikte — Service Worker v3
+   Her güncelleme için CACHE_VERSION'ı artır.
+   Uygulama dosyaları (app.js, index.html vs.) NETWORK-FIRST:
+   önce ağdan çek, ağ yoksa cache'ten sun.
+   Bu sayede yeni kod deploy edilince tüm cihazlar anında güncellenir.
    ============================================================ */
 
-const CACHE_NAME = 'birlikte-v1';
+const CACHE_VERSION = 3;
+const CACHE_NAME    = `birlikte-v${CACHE_VERSION}`;
 
-/* Kurulum: temel dosyaları önbelleğe al (çevrimdışı destek) */
+/* Kurulumda sadece font/ikon gibi statik şeyleri cache'le,
+   uygulama dosyalarını değil — onlar her zaman ağdan gelecek */
 self.addEventListener('install', (event) => {
-  event.waitUntil(
-    caches.open(CACHE_NAME).then((cache) =>
-      cache.addAll(['/', '/index.html', '/style.css', '/app.js', '/firebase-config.js'])
-           .catch(() => {}) // dosya yoksa sessizce geç
-    )
-  );
-  self.skipWaiting();
+  self.skipWaiting(); // hemen aktifleş, eski SW'yi bekletme
 });
 
+self.addEventListener('message', (event) => {
+  if (event.data && event.data.type === 'SKIP_WAITING') self.skipWaiting();
+});
+
+/* Aktifleşince eski tüm cache'leri temizle */
 self.addEventListener('activate', (event) => {
   event.waitUntil(
     caches.keys().then((keys) =>
-      Promise.all(keys.filter((k) => k !== CACHE_NAME).map((k) => caches.delete(k)))
-    )
+      Promise.all(
+        keys
+          .filter((k) => k !== CACHE_NAME)
+          .map((k) => caches.delete(k))
+      )
+    ).then(() => self.clients.claim())
   );
-  self.clients.claim();
 });
 
-/* Fetch: önce ağ, başarısız olursa önbellek */
+/* NETWORK-FIRST: uygulama dosyaları daima tazeden yüklenir */
+const APP_FILES = ['/app.js', '/index.html', '/style.css', '/firebase-config.js', '/'];
+
 self.addEventListener('fetch', (event) => {
   if (event.request.method !== 'GET') return;
-  event.respondWith(
-    fetch(event.request)
-      .then((res) => {
-        const clone = res.clone();
-        caches.open(CACHE_NAME).then((c) => c.put(event.request, clone)).catch(() => {});
-        return res;
+
+  const url = new URL(event.request.url);
+  const isAppFile = APP_FILES.some((f) => url.pathname === f || url.pathname.endsWith(f));
+
+  if (isAppFile) {
+    /* Uygulama dosyaları: NETWORK-FIRST, offline fallback */
+    event.respondWith(
+      fetch(event.request, { cache: 'no-store' })
+        .then((res) => {
+          /* Başarılıysa cache'e yaz (offline fallback için) */
+          caches.open(CACHE_NAME)
+            .then((c) => c.put(event.request, res.clone()))
+            .catch(() => {});
+          return res;
+        })
+        .catch(() => caches.match(event.request))
+    );
+  } else {
+    /* Diğer kaynaklar (resimler, fontlar): CACHE-FIRST */
+    event.respondWith(
+      caches.match(event.request).then((cached) => {
+        if (cached) return cached;
+        return fetch(event.request).then((res) => {
+          caches.open(CACHE_NAME)
+            .then((c) => c.put(event.request, res.clone()))
+            .catch(() => {});
+          return res;
+        });
       })
-      .catch(() => caches.match(event.request))
-  );
+    );
+  }
 });
 
-/* Push bildirimi — FCM entegrasyonu yapıldıysa burası tetiklenir */
+/* ── Push bildirimleri (FCM kuruluysa tetiklenir) ── */
 self.addEventListener('push', (event) => {
   let data = { title: 'birlikte', body: 'Yeni bir mesaj var' };
   try { data = event.data.json(); } catch (e) {}
   event.waitUntil(
     self.registration.showNotification(data.title || 'birlikte', {
-      body: data.body || '',
-      icon: '/favicon.ico',
-      badge: '/favicon.ico',
-      tag: 'birlikte-chat',
-      renotify: true,
+      body:      data.body  || '',
+      icon:      '/favicon.ico',
+      badge:     '/favicon.ico',
+      tag:       'birlikte-chat',
+      renotify:  true,
     })
   );
 });
@@ -60,9 +89,11 @@ self.addEventListener('push', (event) => {
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
   event.waitUntil(
-    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((clients) => {
-      if (clients.length > 0) { clients[0].focus(); return; }
-      self.clients.openWindow('/');
-    })
+    self.clients.matchAll({ type: 'window', includeUncontrolled: true })
+      .then((clients) => {
+        const alive = clients.find((c) => c.url && 'focus' in c);
+        if (alive) return alive.focus();
+        return self.clients.openWindow('/');
+      })
   );
 });

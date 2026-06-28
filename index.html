@@ -80,6 +80,7 @@
         <div class="player-stage" id="playerStage">
           <div id="ytHost"></div>
           <video id="videoEl" playsinline></video>
+          <div id="liveHost"></div>
         </div>
         <div class="reactions-layer" id="reactionsLayer"></div>
         <div class="end-countdown hidden" id="endCountdown">
@@ -130,7 +131,9 @@
           <option value="small">240p</option>
         </select>
         <button class="tool-btn hidden" id="pipBtn" type="button" aria-label="Küçük pencerede izle" title="Resim içinde resim">⧉</button>
+        <button class="tool-btn" id="fullscreenBtn" type="button" aria-label="Tam ekran" title="Tam ekran">⛶</button>
         <button class="tool-btn" id="cinemaBtn" type="button" aria-label="Sinema modu" title="Sinema modu — ışıkları kapat">💡</button>
+        <button class="tool-btn" id="inviteBtn" type="button" aria-label="Davet linki" title="Arkadaşını davet et">🔗</button>
       </div>
     </section>
 
@@ -176,6 +179,7 @@
           <input type="file" id="imageFileInput" accept="image/*" class="hidden">
           <button class="tool-btn" id="imageBtn" type="button" aria-label="Resim ekle">🖼</button>
           <button class="tool-btn" id="stickerBtn" type="button" aria-label="Çıkartma ekle">😊</button>
+          <button class="tool-btn" id="voiceBtn" type="button" aria-label="Sesli mesaj">🎙</button>
           <button class="add-btn" id="sendChatBtn" aria-label="Gönder">↑</button>
         </div>
       </div>
@@ -186,6 +190,21 @@
 
 <div class="lightbox hidden" id="lightbox">
   <img id="lightboxImg" src="" alt="büyütülmüş resim">
+</div>
+
+<!-- Davet Modalı -->
+<div class="modal-overlay hidden" id="inviteModal">
+  <div class="modal-card">
+    <button class="modal-close" id="inviteModalClose">✕</button>
+    <h2 class="modal-title">Arkadaşını Davet Et</h2>
+    <p class="modal-sub">Bu linki ya da QR kodu paylaş</p>
+    <div class="invite-link-row">
+      <input class="text-input" id="inviteLinkInput" readonly>
+      <button class="add-btn" id="inviteCopyBtn" title="Kopyala">⎘</button>
+    </div>
+    <div id="inviteQr" class="invite-qr"></div>
+    <button class="btn-primary full" id="inviteShareBtn" style="display:none">Paylaş (Web Share)</button>
+  </div>
 </div>
 
 <div class="toast" id="toast"></div>

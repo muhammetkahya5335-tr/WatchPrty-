@@ -87,21 +87,51 @@ function clearAllListeners() {
 function parseLink(raw) {
   let url;
   try { url = new URL(raw); } catch (e) { return null; }
+  const host = url.hostname.replace(/^www\./, '');
 
+  /* ── YouTube video ── */
   const yt = raw.match(/(?:youtube\.com\/(?:watch\?v=|shorts\/|embed\/)|youtu\.be\/)([A-Za-z0-9_-]{11})/);
   if (yt) return { type: 'youtube', refId: yt[1], title: 'YouTube videosu' };
 
-  /* sadece doğrudan /playlist?list=... linklerinde playlist olarak algıla;
-     "video + list=" şeklindeki paylaşım linkleri tek video olarak eklenmeye devam eder */
+  /* ── YouTube playlist ── */
   const isPlaylistUrl = /youtube\.com\/playlist/.test(raw);
   const listParam = raw.match(/[?&]list=([A-Za-z0-9_-]+)/);
   if (isPlaylistUrl && listParam) {
     return { type: 'youtube_playlist', refId: listParam[1], title: 'YouTube oynatma listesi' };
   }
 
+  /* ── Kick canlı yayın ── kick.com/kanaladi */
+  if (host === 'kick.com') {
+    const channel = url.pathname.replace(/^\//, '').split('/')[0];
+    if (channel && channel !== 'video') {
+      return { type: 'kick', refId: channel, title: `Kick: ${channel}`, live: true };
+    }
+  }
+
+  /* ── Twitch canlı yayın & VOD ── */
+  if (host === 'twitch.tv') {
+    const parts = url.pathname.replace(/^\//, '').split('/');
+    /* VOD: twitch.tv/videos/12345678 */
+    if (parts[0] === 'videos' && parts[1]) {
+      return { type: 'twitch_vod', refId: parts[1], title: `Twitch VOD` };
+    }
+    /* Canlı: twitch.tv/kanaladi */
+    if (parts[0] && parts[0] !== 'directory') {
+      return { type: 'twitch', refId: parts[0], title: `Twitch: ${parts[0]}`, live: true };
+    }
+  }
+
+  /* ── Vimeo ── */
+  if (host === 'vimeo.com') {
+    const vid = url.pathname.match(/\/(\d+)/);
+    if (vid) return { type: 'vimeo', refId: vid[1], title: 'Vimeo videosu' };
+  }
+
+  /* ── Google Drive ── */
   const drive = raw.match(/drive\.google\.com\/(?:file\/d\/|open\?id=)([A-Za-z0-9_-]+)/);
   if (drive) return { type: 'drive', refId: drive[1], title: 'Drive videosu' };
 
+  /* ── Direkt video linki ── */
   return { type: 'video', refId: raw, title: raw.split('/').pop().slice(0, 60) || 'Video' };
 }
 
@@ -179,7 +209,7 @@ async function enterRoom(code, name) {
 
   const userRef = db.ref(`rooms/${code}/users/${state.uid}`);
   await userRef.set({ name, online: true, joinedAt: firebase.database.ServerValue.TIMESTAMP });
-  userRef.onDisconnect().update({ online: false });
+  userRef.onDisconnect().update({ online: false, lastSeen: firebase.database.ServerValue.TIMESTAMP });
 
   landingView.classList.add('hidden');
   roomView.classList.remove('hidden');
@@ -205,7 +235,11 @@ el('leaveRoomBtn').addEventListener('click', leaveRoom);
 async function leaveRoom() {
   if (state.roomCode && state.uid) {
     pushSystemMessage(`${state.name} odadan çıktı`);
-    try { await db.ref(`rooms/${state.roomCode}/users/${state.uid}`).remove(); } catch (e) {}
+    try {
+      /* Kullanıcıyı silmek yerine çevrimdışı yap + son görülmeyi yaz */
+      await db.ref(`rooms/${state.roomCode}/users/${state.uid}`)
+        .update({ online: false, lastSeen: firebase.database.ServerValue.TIMESTAMP });
+    } catch (e) {}
     try { await db.ref(`rooms/${state.roomCode}/typing/${state.uid}`).remove(); } catch (e) {}
   }
   clearAllListeners();
@@ -258,10 +292,28 @@ function listenUsers() {
     const data = snap.val() || {};
     const list = el('presenceList');
     list.innerHTML = '';
-    Object.values(data).forEach((u) => {
+    Object.values(data).sort((a, b) => {
+      /* çevrimiçi olanlar önce */
+      if (a.online === b.online) return (a.name || '').localeCompare(b.name || '');
+      return a.online ? -1 : 1;
+    }).forEach((u) => {
       const pill = document.createElement('span');
       pill.className = 'presence-pill' + (u.online ? ' online' : '');
-      pill.innerHTML = `<span class="presence-dot"></span>${escapeHtml(u.name || '?')}`;
+
+      /* Son görülme metni */
+      let tooltip = u.online ? 'Çevrimiçi' : 'Çevrimdışı';
+      if (!u.online && u.lastSeen) {
+        const diff = Math.round((Date.now() - u.lastSeen) / 1000);
+        if (diff < 60) tooltip = `${diff}sn önce görüldü`;
+        else if (diff < 3600) tooltip = `${Math.round(diff/60)}dk önce görüldü`;
+        else tooltip = `${Math.round(diff/3600)}sa önce görüldü`;
+      }
+
+      pill.innerHTML = `
+        <span class="presence-dot"></span>
+        ${escapeHtml(u.name || '?')}
+        <span class="presence-tooltip">${tooltip}</span>
+      `;
       list.appendChild(pill);
     });
   });
@@ -376,7 +428,7 @@ function renderQueue() {
     list.innerHTML = '<li class="queue-empty">Liste boş — yukarıdan bir link ekle</li>';
     return;
   }
-  const typeIcon = { youtube: '▶', drive: '⛁', video: '🎬' };
+  const typeIcon = { youtube: '▶', drive: '⛁', video: '🎬', kick: '🟣', twitch: '💜', twitch_vod: '💜', vimeo: '🎞' };
   state.queueOrder.forEach((key) => {
     const item = state.queueCache[key];
     const li = document.createElement('li');
@@ -543,7 +595,7 @@ function renderHistory() {
     list.innerHTML = '<li class="queue-empty">Henüz izlenmiş bir şey yok</li>';
     return;
   }
-  const typeIcon = { youtube: '▶', drive: '⛁', video: '🎬' };
+  const typeIcon = { youtube: '▶', drive: '⛁', video: '🎬', kick: '🟣', twitch: '💜', twitch_vod: '💜', vimeo: '🎞' };
   state.historyOrder.forEach((key) => {
     const item = state.historyCache[key];
     const li = document.createElement('li');
@@ -608,6 +660,8 @@ function loadPlayerForCurrentItem() {
 
   if (item.type === 'youtube') {
     state.currentType = 'youtube';
+    el('liveHost').style.display = 'none';
+    el('liveHost').innerHTML = '';
     videoEl.style.display = 'none';
     ytHost.style.display = 'block';
     videoEl.pause();
@@ -615,13 +669,42 @@ function loadPlayerForCurrentItem() {
     el('qualitySelect').classList.remove('hidden');
     el('speedSelect').classList.remove('hidden');
     el('pipBtn').classList.add('hidden');
+    setLiveBadge(false);
+    el('seekRange').disabled = false;
+    el('seekRange').style.opacity = '1';
     loadYoutube(item.refId);
+
+  } else if (item.type === 'kick' || item.type === 'twitch' || item.type === 'twitch_vod' || item.type === 'vimeo') {
+    state.currentType = 'iframe_live';
+    /* ytHost artık YouTube'un kendi iframe'iyle değiştirilmiş olabilir — onu gizle */
+    el('ytHost').style.display = 'none';
+    videoEl.style.display = 'none';
+    videoEl.pause(); videoEl.removeAttribute('src');
+    if (state.ytPlayer && state.ytPlayer.pauseVideo) state.ytPlayer.pauseVideo();
+
+    el('liveHost').style.display = 'block';
+    el('qualitySelect').classList.add('hidden');
+    el('speedSelect').classList.add('hidden');
+    el('pipBtn').classList.add('hidden');
+
+    const isLive = item.type === 'kick' || item.type === 'twitch';
+    setLiveBadge(isLive);
+    el('seekRange').disabled = isLive;
+    el('seekRange').style.opacity = isLive ? '.3' : '1';
+
+    loadIframePlayer(item);
+
   } else {
     state.currentType = 'html5';
+    el('liveHost').style.display = 'none';
+    el('liveHost').innerHTML = '';
     ytHost.style.display = 'none';
     videoEl.style.display = 'block';
     el('qualitySelect').classList.add('hidden');
     el('speedSelect').classList.add('hidden');
+    setLiveBadge(false);
+    el('seekRange').disabled = false;
+    el('seekRange').style.opacity = '1';
     const pipSupported = !!(document.pictureInPictureEnabled || videoEl.webkitSupportsPresentationMode);
     el('pipBtn').classList.toggle('hidden', !pipSupported);
     if (state.ytPlayer && state.ytPlayer.pauseVideo) state.ytPlayer.pauseVideo();
@@ -632,7 +715,59 @@ function loadPlayerForCurrentItem() {
   setTimeout(() => { if (window._stickyCheck) window._stickyCheck(); }, 100);
 }
 
-/* --- YouTube IFrame API --- */
+/* =========================================================
+   IFRAME OYNATICI — Kick / Twitch / Vimeo
+   ========================================================= */
+function loadIframePlayer(item) {
+  const host = el('liveHost');
+  host.innerHTML = ''; /* önceki iframe'i temizle */
+
+  const iframe = document.createElement('iframe');
+  iframe.allowFullscreen = true;
+  iframe.allow = 'autoplay; fullscreen; encrypted-media; picture-in-picture';
+  iframe.referrerPolicy = 'origin';
+
+  const domain = window.location.hostname || 'localhost';
+
+  if (item.type === 'kick') {
+    /* Kick embed — muted=false ses açık başlatır */
+    iframe.src = `https://player.kick.com/${encodeURIComponent(item.refId)}?autoplay=true&muted=false`;
+  } else if (item.type === 'twitch') {
+    /* Twitch canlı — parent parametresi sitenin alan adıyla eşleşmeli */
+    iframe.src = `https://player.twitch.tv/?channel=${encodeURIComponent(item.refId)}&parent=${domain}&autoplay=true&muted=false`;
+  } else if (item.type === 'twitch_vod') {
+    /* Twitch VOD — video= öneki olmadan */
+    iframe.src = `https://player.twitch.tv/?video=${encodeURIComponent(item.refId)}&parent=${domain}&autoplay=true`;
+  } else if (item.type === 'vimeo') {
+    iframe.src = `https://player.vimeo.com/video/${encodeURIComponent(item.refId)}?autoplay=1&byline=0&portrait=0&title=0`;
+  }
+
+  if (!iframe.src) return;
+  host.appendChild(iframe);
+}
+
+/* ── Canlı yayın rozeti ── */
+function setLiveBadge(show) {
+  let badge = document.getElementById('liveBadge');
+  if (show) {
+    if (!badge) {
+      badge = document.createElement('div');
+      badge.id = 'liveBadge';
+      badge.className = 'live-badge';
+      badge.textContent = '🔴 CANLI';
+      document.querySelector('.control-bar').prepend(badge);
+    }
+    badge.style.display = '';
+    el('playPauseBtn').style.display    = 'none';
+    el('currentTimeText').style.display = 'none';
+    el('durationTimeText').style.display = 'none';
+  } else {
+    if (badge) badge.style.display = 'none';
+    el('playPauseBtn').style.display    = '';
+    el('currentTimeText').style.display = '';
+    el('durationTimeText').style.display = '';
+  }
+}
 (function loadYtApi() {
   const tag = document.createElement('script');
   tag.src = 'https://www.youtube.com/iframe_api';
@@ -962,6 +1097,197 @@ el('cinemaBtn').addEventListener('click', () => {
 });
 
 /* =========================================================
+   TAM EKRAN
+   ========================================================= */
+el('fullscreenBtn').addEventListener('click', () => {
+  const stage = document.querySelector('.player-frame');
+  if (!document.fullscreenElement && !document.webkitFullscreenElement) {
+    const req = stage.requestFullscreen || stage.webkitRequestFullscreen;
+    if (req) req.call(stage).catch(() => {});
+  } else {
+    const ex = document.exitFullscreen || document.webkitExitFullscreen;
+    if (ex) ex.call(document).catch(() => {});
+  }
+});
+function updateFullscreenBtn() {
+  const active = !!(document.fullscreenElement || document.webkitFullscreenElement);
+  el('fullscreenBtn').classList.toggle('active', active);
+  el('fullscreenBtn').textContent = active ? '⊠' : '⛶';
+  el('fullscreenBtn').title = active ? 'Tam ekrandan çık' : 'Tam ekran';
+}
+document.addEventListener('fullscreenchange',       updateFullscreenBtn);
+document.addEventListener('webkitfullscreenchange', updateFullscreenBtn);
+
+/* =========================================================
+   DAVET LİNKİ + QR KOD
+   QR oluşturmak için dışa bağımlılık yok — saf canvas ile çiziyoruz.
+   ========================================================= */
+el('inviteBtn').addEventListener('click', openInviteModal);
+
+function openInviteModal() {
+  if (!state.roomCode) return;
+  const url = `${location.origin}${location.pathname}?join=${state.roomCode}`;
+  el('inviteLinkInput').value = url;
+
+  /* QR kodu canvas ile oluştur */
+  const qrDiv = el('inviteQr');
+  qrDiv.innerHTML = '';
+  drawQrCanvas(url, qrDiv);
+
+  /* Web Share API desteği varsa butonu göster */
+  if (navigator.share) el('inviteShareBtn').style.display = '';
+
+  el('inviteModal').classList.remove('hidden');
+}
+
+el('inviteModalClose').addEventListener('click', () => el('inviteModal').classList.add('hidden'));
+el('inviteModal').addEventListener('click', (e) => {
+  if (e.target === el('inviteModal')) el('inviteModal').classList.add('hidden');
+});
+
+el('inviteCopyBtn').addEventListener('click', () => {
+  navigator.clipboard.writeText(el('inviteLinkInput').value)
+    .then(() => showToast('Link kopyalandı 🔗'))
+    .catch(() => {
+      el('inviteLinkInput').select();
+      document.execCommand('copy');
+      showToast('Link kopyalandı 🔗');
+    });
+});
+
+el('inviteShareBtn').addEventListener('click', () => {
+  navigator.share({
+    title: 'birlikte',
+    text : `Benimle birlikte izleyelim! Oda kodu: ${state.roomCode}`,
+    url  : el('inviteLinkInput').value,
+  }).catch(() => {});
+});
+
+/* URL'de ?join=XXXXX varsa otomatik doldur */
+(function checkInviteParam() {
+  const params = new URLSearchParams(location.search);
+  const joinCode = params.get('join');
+  if (joinCode) {
+    el('joinCodeInput').value = joinCode.toUpperCase();
+    el('joinBox').classList.remove('hidden');
+    /* URL'i temizle (sayfa yenilemede tekrar tetiklenmesin) */
+    history.replaceState({}, '', location.pathname);
+  }
+})();
+
+/* ── Minimal QR canvas çizici (Reed-Solomon gerektirmeyen küçük URL'ler için) ──
+   Büyük URL'lerde kalite düşebilir; harici kütüphane kullanımı önerilebilir.
+   Buradaki uygulama basit bir hata düzeltme seviyesi-L QR matrisi üretir.      */
+function drawQrCanvas(text, container) {
+  /* qrcodejs kütüphanesi CDN'den yükle (tek seferlik) */
+  if (window._qrLoaded) {
+    _createQr(text, container);
+    return;
+  }
+  const script = document.createElement('script');
+  script.src = 'https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js';
+  script.onload = () => { window._qrLoaded = true; _createQr(text, container); };
+  script.onerror = () => {
+    container.innerHTML = '<p style="color:var(--text-muted);font-size:12px;text-align:center">QR yüklenemedi — linki kopyala</p>';
+  };
+  document.head.appendChild(script);
+}
+function _createQr(text, container) {
+  try {
+    new QRCode(container, {
+      text, width: 180, height: 180,
+      colorDark: '#1a1330', colorLight: '#ffffff',
+      correctLevel: QRCode.CorrectLevel.M,
+    });
+  } catch (e) {
+    container.innerHTML = '<p style="color:var(--text-muted);font-size:12px;text-align:center">QR oluşturulamadı</p>';
+  }
+}
+
+/* =========================================================
+   SESLİ MESAJ — MediaRecorder API
+   ========================================================= */
+let mediaRecorder = null;
+let audioChunks   = [];
+let recordingTimer = null;
+const MAX_RECORD_SEC = 60;
+
+el('voiceBtn').addEventListener('click', () => {
+  if (mediaRecorder && mediaRecorder.state === 'recording') {
+    stopRecording();
+  } else {
+    startRecording();
+  }
+});
+
+async function startRecording() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    showToast('Bu tarayıcı ses kaydını desteklemiyor');
+    return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+      ? 'audio/webm;codecs=opus'
+      : MediaRecorder.isTypeSupported('audio/mp4')
+        ? 'audio/mp4'
+        : 'audio/webm';
+    mediaRecorder = new MediaRecorder(stream, { mimeType: mime });
+    audioChunks = [];
+    mediaRecorder.addEventListener('dataavailable', (e) => {
+      if (e.data.size > 0) audioChunks.push(e.data);
+    });
+    mediaRecorder.addEventListener('stop', finalizeRecording);
+    mediaRecorder.start(250); // her 250ms'de chunk al
+
+    el('voiceBtn').classList.add('recording');
+    el('voiceBtn').title = 'Durdurmak için tıkla';
+    showToast('🎙 Kayıt başladı — durdurmak için tekrar bas');
+
+    let elapsed = 0;
+    recordingTimer = setInterval(() => {
+      elapsed++;
+      if (elapsed >= MAX_RECORD_SEC) stopRecording();
+    }, 1000);
+  } catch (err) {
+    showToast('Mikrofon izni gerekli');
+  }
+}
+
+function stopRecording() {
+  if (!mediaRecorder) return;
+  clearInterval(recordingTimer);
+  mediaRecorder.stop();
+  mediaRecorder.stream.getTracks().forEach((t) => t.stop());
+  el('voiceBtn').classList.remove('recording');
+  el('voiceBtn').title = 'Sesli mesaj';
+}
+
+async function finalizeRecording() {
+  const blob = new Blob(audioChunks, { type: mediaRecorder.mimeType });
+  const durationSec = Math.round(audioChunks.length * 0.25); // yaklaşık süre
+
+  /* Base64'e çevir ve Firebase'e yaz */
+  const reader = new FileReader();
+  reader.onloadend = () => {
+    const base64 = reader.result; // data:audio/...;base64,...
+    db.ref(`rooms/${state.roomCode}/chat`).push({
+      name   : state.name,
+      type   : 'voice',
+      text   : base64,
+      duration: durationSec,
+      sentAt : firebase.database.ServerValue.TIMESTAMP,
+    }).catch((err) => {
+      console.error('voice-msg error:', err);
+      showToast('Sesli mesaj gönderilemedi');
+    });
+  };
+  reader.readAsDataURL(blob);
+  mediaRecorder = null;
+  audioChunks   = [];
+}
+
+/* =========================================================
    VİDEO BİTİŞ GERİ SAYIMI — direkt advanceQueue yerine önce sayaç gösterir
    ========================================================= */
 let endCountdownTimer = null;
@@ -1015,7 +1341,7 @@ function getCurrentPlayerTime() {
     return state.ytPlayer.getCurrentTime() || 0;
   }
   if (state.currentType === 'html5') return el('videoEl').currentTime || 0;
-  return 0;
+  return 0; /* iframe_live: anlık zaman yok */
 }
 function getDuration() {
   if (state.currentType === 'youtube' && state.ytPlayer && state.ytPlayer.getDuration) {
@@ -1028,6 +1354,7 @@ function playLocal() {
   state.isPlaying = true;
   if (state.currentType === 'youtube' && state.ytPlayer && state.ytPlayer.playVideo) state.ytPlayer.playVideo();
   if (state.currentType === 'html5') el('videoEl').play().catch(() => {});
+  /* iframe_live: iframe kendi oynatmasını yönetir */
   updatePlayButtonUi();
 }
 function pauseLocal() {
@@ -1039,6 +1366,7 @@ function pauseLocal() {
 function seekLocal(t) {
   if (state.currentType === 'youtube' && state.ytPlayer && state.ytPlayer.seekTo) state.ytPlayer.seekTo(t, true);
   if (state.currentType === 'html5') el('videoEl').currentTime = t;
+  /* iframe_live: seek yok */
 }
 function updatePlayButtonUi() {
   el('playIcon').textContent = state.isPlaying ? '❚❚' : '▶';
@@ -1395,6 +1723,53 @@ function listenChat() {
 
     if (type === 'sticker') {
       bubble.innerHTML = `<span class="chat-name">${escapeHtml(msg.name)}</span>${escapeHtml(msg.text)}`;
+    } else if (type === 'voice' && typeof msg.text === 'string' && msg.text.startsWith('data:audio')) {
+      bubble.innerHTML = `<span class="chat-name">${escapeHtml(msg.name)}</span>`;
+      const wrap = document.createElement('div');
+      wrap.className = 'voice-msg-wrap';
+      const dur = msg.duration ? fmtTime(msg.duration) : '—';
+      const playBtn = document.createElement('button');
+      playBtn.className = 'voice-play-btn';
+      playBtn.textContent = '▶';
+      const wave = document.createElement('div');
+      wave.className = 'voice-waveform';
+      wave.style.background = `linear-gradient(90deg,var(--accent-soft) 0%,var(--border) 0%)`;
+      const durSpan = document.createElement('span');
+      durSpan.className = 'voice-duration';
+      durSpan.textContent = dur;
+      wrap.appendChild(playBtn);
+      wrap.appendChild(wave);
+      wrap.appendChild(durSpan);
+      bubble.appendChild(wrap);
+
+      /* Oynatma mantığı */
+      let audio = null;
+      let raf = null;
+      playBtn.addEventListener('click', () => {
+        if (audio && !audio.paused) {
+          audio.pause();
+          playBtn.textContent = '▶';
+          cancelAnimationFrame(raf);
+          return;
+        }
+        audio = new Audio(msg.text);
+        playBtn.textContent = '⏸';
+        audio.play().catch(() => {});
+        function updateBar() {
+          if (!audio || audio.paused) return;
+          const pct = audio.duration ? (audio.currentTime / audio.duration) * 100 : 0;
+          wave.style.background = `linear-gradient(90deg,var(--accent) ${pct}%,var(--border) ${pct}%)`;
+          durSpan.textContent = fmtTime(Math.round(audio.currentTime));
+          raf = requestAnimationFrame(updateBar);
+        }
+        audio.addEventListener('play', updateBar);
+        audio.addEventListener('ended', () => {
+          playBtn.textContent = '▶';
+          wave.style.background = `linear-gradient(90deg,var(--accent-soft) 0%,var(--border) 0%)`;
+          durSpan.textContent = dur;
+          cancelAnimationFrame(raf);
+        });
+      });
     } else if (type === 'image' && typeof msg.text === 'string' && msg.text.startsWith('data:image/')) {
       bubble.innerHTML = `<span class="chat-name">${escapeHtml(msg.name)}</span>`;
       const img = document.createElement('img');

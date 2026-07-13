@@ -343,6 +343,60 @@ function forceLeaveRoomClosed() {
 })();
 
 /* =========================================================
+   TERK EDİLMİŞ ODALARIN OTOMATİK TEMİZLİĞİ (client-side)
+   Sunucu/Cloud Function olmadan, uygulama her açıldığında
+   düşük ihtimalle çalışıp içinde kimse olmayan ve uzun süredir
+   hareketsiz odaları siler. Böylece DB'de yer kaplamaz.
+   ========================================================= */
+const STALE_ROOM_MS = 24 * 60 * 60 * 1000; // 24 saatten uzun süredir hareketsiz odalar silinir
+const CLEANUP_CHANCE = 0.15; // her yüklemede %15 ihtimalle tetiklenir (DB okuma yükünü sınırlamak için)
+
+async function cleanupStaleRooms() {
+  if (Math.random() > CLEANUP_CHANCE) return;
+  try {
+    const snap = await db.ref('rooms').get();
+    if (!snap.exists()) return;
+    const now = Date.now();
+    const rooms = snap.val();
+    const staleCodes = [];
+
+    Object.entries(rooms).forEach(([code, room]) => {
+      const users = room.users || {};
+      const anyOnline = Object.values(users).some((u) => u && u.online);
+      if (anyOnline) return; // içinde biri varsa dokunma
+
+      // odanın en son ne zaman "canlı" olduğunu bul
+      let lastActivity = (room.meta && room.meta.createdAt) || 0;
+      Object.values(users).forEach((u) => {
+        const t = (u && (u.lastSeen || u.joinedAt)) || 0;
+        if (t > lastActivity) lastActivity = t;
+      });
+      if (room.chat) {
+        Object.values(room.chat).forEach((m) => {
+          const t = (m && m.sentAt) || 0;
+          if (t > lastActivity) lastActivity = t;
+        });
+      }
+
+      // zaman bilgisi hiç yoksa (bozuk/yarım kalmış oda) ya da eşikten eskiyse sil
+      if (!lastActivity || (now - lastActivity) > STALE_ROOM_MS) {
+        staleCodes.push(code);
+      }
+    });
+
+    if (staleCodes.length) {
+      const updates = {};
+      staleCodes.forEach((code) => { updates[`rooms/${code}`] = null; });
+      await db.ref().update(updates);
+      console.log('Terk edilmiş odalar temizlendi:', staleCodes);
+    }
+  } catch (err) {
+    console.error('cleanupStaleRooms hata:', err);
+  }
+}
+cleanupStaleRooms();
+
+/* =========================================================
    BAĞLANTI DURUMU
    ========================================================= */
 function startConnectionWatcher() {

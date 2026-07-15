@@ -27,6 +27,7 @@ const state = {
   unreadChat: 0,
   isAdmin: false,       // oda sahibi mi?
   canControl: false,    // oynatma kontrolü var mı? (admin veya yetkilendirilmiş)
+  userRef: null,        // kendi users/{uid} düğümümüzün referansı (onDisconnect iptali için)
 };
 
 function serverTimeNow() { return Date.now() + (state.serverOffset || 0); }
@@ -219,6 +220,7 @@ async function enterRoom(code, name, isCreator = false) {
   localStorage.setItem('wt_name', name);
 
   const userRef = db.ref(`rooms/${code}/users/${state.uid}`);
+  state.userRef = userRef;
   await userRef.set({ name, online: true, joinedAt: firebase.database.ServerValue.TIMESTAMP });
   userRef.onDisconnect().update({ online: false, lastSeen: firebase.database.ServerValue.TIMESTAMP });
 
@@ -266,11 +268,22 @@ el('leaveRoomBtn').addEventListener('click', leaveRoom);
 async function leaveRoom() {
   if (state.roomCode && state.uid) {
     state.leavingIntentionally = true;
+    // Kendi kullanıcı düğümümüze bağlı onDisconnect kaydını iptal et; yoksa
+    // ileride bu sekme kapanınca oda silinmiş olsa bile yeniden "hayalet"
+    // bir users/{uid} kaydı oluşturabilir.
+    if (state.userRef) {
+      try { await state.userRef.onDisconnect().cancel(); } catch (e) { console.error('userRef onDisconnect iptali başarısız:', e); }
+    }
     if (state.isAdmin) {
       // Oda sahibi çıkıyor: herkesi atmak ve odayı temizlemek için
       // tüm oda düğümünü sil. (Diğer kullanıcılar listenRoomAlive ile fark edip atılır.)
-      try { await db.ref(`rooms/${state.roomCode}`).onDisconnect().cancel(); } catch (e) {}
-      try { await db.ref(`rooms/${state.roomCode}`).remove(); } catch (e) {}
+      try { await db.ref(`rooms/${state.roomCode}`).onDisconnect().cancel(); } catch (e) { console.error('room onDisconnect iptali başarısız:', e); }
+      try {
+        await db.ref(`rooms/${state.roomCode}`).remove();
+      } catch (e) {
+        console.error('Oda silinemedi:', e);
+        showToast('Oda silinemedi: ' + (e && e.message ? e.message : 'izin hatası olabilir'));
+      }
     } else {
       pushSystemMessage(`${state.name} odadan çıktı`);
       try {
@@ -291,6 +304,7 @@ async function leaveRoom() {
   state.roomCode = null;
   state.isAdmin = false;
   state.canControl = false;
+  state.userRef = null;
   state.leavingIntentionally = false;
   roomView.classList.add('hidden');
   landingView.classList.remove('hidden');
@@ -547,9 +561,10 @@ async function addLinkToQueue() {
     addedAt: firebase.database.ServerValue.TIMESTAMP,
   });
 
-  // Sadece yetkili kullanıcılar currentItem ve playback yazabilir
-  if (!state.currentItemId && canWrite()) {
-    await setCurrentItem(ref.key);
+  // Kuyruk boşsa, kim eklerse eklesin ilk video otomatik oynatılan video olsun.
+  // (Zaten bir video oynuyorsa, değiştirmek hâlâ sadece yetkili kullanıcılarda.)
+  if (!state.currentItemId) {
+    await setCurrentItem(ref.key, { force: true });
   }
   pushSystemMessage(`${state.name} listeye "${parsed.title}" videosunu ekledi`);
   input.value = '';
@@ -591,7 +606,7 @@ async function addYoutubePlaylistToQueue(playlistId) {
     } while (pageToken);
 
     if (added === 0) { showToast('Oynatma listesinde video bulunamadı'); return; }
-    if (!state.currentItemId && firstKey && canWrite()) await setCurrentItem(firstKey);
+    if (!state.currentItemId && firstKey) await setCurrentItem(firstKey, { force: true });
     pushSystemMessage(`${state.name} oynatma listesinden ${added} video ekledi`);
     showToast(`${added} video listeye eklendi`);
   } catch (err) {
@@ -727,8 +742,9 @@ async function removeQueueItem(key) {
   }
 }
 
-async function setCurrentItem(key) {
-  if (!canWrite()) return;
+async function setCurrentItem(key, opts = {}) {
+  const force = !!opts.force;
+  if (!force && !canWrite()) return;
   const item = state.queueCache[key];
   await db.ref(`rooms/${state.roomCode}/currentItemId`).set(key);
   await db.ref(`rooms/${state.roomCode}/playback`).set({
@@ -821,7 +837,7 @@ async function readdFromHistory(item) {
     type: item.type, refId: item.refId, title: item.title,
     addedBy: state.name, addedAt: firebase.database.ServerValue.TIMESTAMP,
   });
-  if (!state.currentItemId && canWrite()) await setCurrentItem(ref.key);
+  if (!state.currentItemId) await setCurrentItem(ref.key, { force: true });
   showToast('Tekrar listeye eklendi');
 }
 
@@ -846,6 +862,17 @@ function loadPlayerForCurrentItem() {
   hideEndCountdown();
 
   if (!item) {
+    // currentItemId zaten ayarlı ama kuyruk verisi henüz senkronize olmamış olabilir
+    // (iki farklı Firebase dinleyicisi arasındaki kısa gecikme). Doğrudan çekip tekrar dene.
+    if (state.currentItemId) {
+      const key = state.currentItemId;
+      db.ref(`rooms/${state.roomCode}/queue/${key}`).get().then((snap) => {
+        if (snap.exists() && state.currentItemId === key) {
+          state.queueCache[key] = snap.val();
+          loadPlayerForCurrentItem();
+        }
+      }).catch(() => {});
+    }
     stage.classList.remove('active');
     empty.classList.remove('hidden');
     el('speedSelect').classList.add('hidden');

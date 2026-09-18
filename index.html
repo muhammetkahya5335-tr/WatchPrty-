@@ -74,7 +74,7 @@
       <div class="player-frame">
         <div class="player-empty" id="playerEmpty">
           <span>henüz video seçilmedi</span>
-          <span class="player-empty-sub">aşağıdan bir link ekleyin</span>
+          <span class="player-empty-sub">bir link ekleyin ya da 📁 ile kendi videonuzu yayınlayın</span>
         </div>
         <div class="player-stage" id="playerStage">
           <div id="ytHost"></div>
@@ -150,6 +150,8 @@
       <div class="sidebar-panel" id="queuePanel">
         <div class="add-link-row">
           <input type="text" id="linkInput" class="text-input" placeholder="YouTube, Drive ya da video linki yapıştır">
+          <input type="file" id="localFileInput" accept="video/*,.mkv" multiple class="hidden">
+          <button class="tool-btn" id="localFileBtn" type="button" aria-label="Cihazımdan video yayınla" title="Cihazındaki videoyu odaya yayınla (kimse indirmez)">📁</button>
           <button class="add-btn" id="addLinkBtn" aria-label="Listeye ekle">+</button>
         </div>
         <p class="error-text" id="queueError"></p>

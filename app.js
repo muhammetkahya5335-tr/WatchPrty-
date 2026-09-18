@@ -180,7 +180,8 @@ function startHostBroadcast(key) {
       if (rtc.key !== key) { resolve(null); return; }
       try {
         const cap = v.captureStream ? v.captureStream() : v.mozCaptureStream();
-        for (let i = 0; i < 25 && cap.getTracks().length === 0; i++) await sleep(150);
+        // Büyük/uzun dosyalarda ilk karenin hazır olması daha uzun sürebilir
+        for (let i = 0; i < 60 && cap.getTracks().length === 0; i++) await sleep(200);
         if (rtc.key !== key) { resolve(null); return; }
         resolve(cap.getTracks().length ? cap : null);
       } catch (e) { console.error(e); resolve(null); }
@@ -346,6 +347,195 @@ window.addEventListener('beforeunload', (e) => {
 /* ---------- Dosya seçimi ---------- */
 const VIDEO_NAME_RE = /\.(mp4|m4v|webm|mov|mkv|ogv)$/i;
 
+/* Dosya adı/MIME'a bakmadan, tarayıcının videoyu GERÇEKTEN görüntü karesi
+   üretecek şekilde açıp açamadığını test eder. Uzun/film gibi dosyalar çoğu
+   zaman MKV konteyneri ya da HEVC/H.265 kodeği kullanır; bu durumda tarayıcı
+   metadata'yı (süre, zaman) okuyabilir, hatta ses çalabilir ama görüntü
+   karesi hiç üretmez → ekran siyah kalır (kısa telefon videoları genelde
+   H.264 MP4 olduğu için sorunsuz açılır). Bunu dosya eklenmeden önce
+   yakalayıp kullanıcıya net bir hata vermek için kullanılır. */
+function probeVideoFile(url) {
+  return new Promise((resolve) => {
+    const probe = document.createElement('video');
+    probe.preload = 'metadata';
+    probe.muted = true;
+    probe.playsInline = true;
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      probe.removeEventListener('loadedmetadata', onMeta);
+      probe.removeEventListener('error', onError);
+      clearTimeout(timer);
+      probe.removeAttribute('src');
+      probe.load();
+      resolve(result);
+    };
+    const onMeta = () => {
+      // Metadata yüklendi ama genişlik/yükseklik 0 ise video izi çözülemiyor demektir
+      if (probe.videoWidth > 0 && probe.videoHeight > 0) finish({ ok: true });
+      else finish({ ok: false, reason: 'no-video-track' });
+    };
+    const onError = () => finish({ ok: false, reason: 'decode-error' });
+    probe.addEventListener('loadedmetadata', onMeta);
+    probe.addEventListener('error', onError);
+    // Büyük/uzun dosyalarda metadata okuma daha uzun sürebilir
+    const timer = setTimeout(() => finish({ ok: false, reason: 'timeout' }), 20000);
+    probe.src = url;
+  });
+}
+
+function unplayableVideoMessage(fileName, reason) {
+  if (reason === 'no-video-track') {
+    return `"${fileName}" için görüntü çözülemedi (kodek desteklenmiyor olabilir).`;
+  }
+  if (reason === 'timeout') {
+    return `"${fileName}" çok uzun sürede açılamadı — dosya çok büyük ya da format desteklenmiyor olabilir.`;
+  }
+  return `"${fileName}" açılamadı — dosya bozuk olabilir ya da format desteklenmiyor.`;
+}
+
+/* =========================================================
+   TARAYICIDA OYNATILAMAYAN VİDEOLARI OTOMATİK DÖNÜŞTÜRME
+   Bazı "film" dosyaları MKV konteyneri ya da HEVC/H.265 kodeği
+   kullanır; bunlar Chrome/Firefox'ta doğrudan oynatılamaz (görüntü
+   siyah kalır). Bu bölüm önce hızlı bir "remux" dener (kodeği
+   DEĞİŞTİRMEDEN sadece MP4 kutusuna aktarır — saniyeler sürer,
+   kalite kaybı yok). O işe yaramazsa (kodeğin kendisi desteklenmiyorsa)
+   tam dönüştürme yapar (H.264/AAC'e yeniden kodlar — uzun/büyük
+   dosyalarda epey sürebilir, bu yüzden ilerleme ve iptal seçeneği var).
+   ========================================================= */
+let ffmpegInstance = null;
+let ffmpegLoadPromise = null;
+let ffmpegProgressCb = null;
+let activeFfmpegCancel = null;
+
+function loadFfmpegCore() {
+  if (ffmpegInstance) return Promise.resolve(ffmpegInstance);
+  if (ffmpegLoadPromise) return ffmpegLoadPromise;
+  ffmpegLoadPromise = (async () => {
+    if (typeof FFmpegWASM === 'undefined' || typeof FFmpegUtil === 'undefined') {
+      throw new Error('ffmpeg.wasm yüklenemedi');
+    }
+    const ffmpeg = new FFmpegWASM.FFmpeg();
+    ffmpeg.on('progress', ({ progress }) => {
+      if (ffmpegProgressCb && isFinite(progress)) ffmpegProgressCb(Math.min(1, Math.max(0, progress)));
+    });
+    const base = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/umd';
+    await ffmpeg.load({
+      coreURL: await FFmpegUtil.toBlobURL(`${base}/ffmpeg-core.js`, 'text/javascript'),
+      wasmURL: await FFmpegUtil.toBlobURL(`${base}/ffmpeg-core.wasm`, 'application/wasm'),
+    });
+    ffmpegInstance = ffmpeg;
+    return ffmpeg;
+  })();
+  ffmpegLoadPromise.catch(() => { ffmpegLoadPromise = null; });
+  return ffmpegLoadPromise;
+}
+
+function setProgressUi(text, onCancel) {
+  const box = el('queueError');
+  box.classList.add('progress-text');
+  box.innerHTML = '';
+  box.appendChild(document.createTextNode(text));
+  if (onCancel) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'inline-cancel-btn';
+    btn.textContent = 'İptal';
+    btn.addEventListener('click', onCancel);
+    box.appendChild(btn);
+  }
+}
+function clearProgressUi() {
+  const box = el('queueError');
+  box.classList.remove('progress-text');
+  box.textContent = '';
+}
+
+/* args: ffmpeg -i <girdi> [...args] <çıktıAdı] çalıştırır, sonucu Blob olarak döner.
+   Kullanıcı iptal ederse null döner. */
+async function runFfmpegJob(file, args, outName, onProgress) {
+  const ffmpeg = await loadFfmpegCore();
+  const inName = 'in_' + Math.random().toString(36).slice(2, 8) + (file.name.match(/\.[^.]+$/)?.[0] || '.bin');
+  let cancelled = false;
+  activeFfmpegCancel = () => {
+    cancelled = true;
+    try { ffmpeg.terminate(); } catch (e) {}
+    ffmpegInstance = null;
+    ffmpegLoadPromise = null;
+  };
+  ffmpegProgressCb = onProgress || null;
+  try {
+    await ffmpeg.writeFile(inName, await FFmpegUtil.fetchFile(file));
+    if (cancelled) return null;
+    await ffmpeg.exec(['-i', inName, ...args, outName]);
+    if (cancelled) return null;
+    const data = await ffmpeg.readFile(outName);
+    return new Blob([data.buffer], { type: 'video/mp4' });
+  } catch (e) {
+    if (cancelled) return null;
+    throw e;
+  } finally {
+    ffmpegProgressCb = null;
+    activeFfmpegCancel = null;
+    if (!cancelled) {
+      try { await ffmpeg.deleteFile(inName); } catch (e) {}
+      try { await ffmpeg.deleteFile(outName); } catch (e) {}
+    }
+  }
+}
+
+/* Dosyayı ekleyebilmek için gerekirse dönüştürür. Sonuç: { ok, file, url, cancelled, reason } */
+async function ensurePlayableVideoFile(file) {
+  let workingFile = file;
+  let objectUrl = URL.createObjectURL(workingFile);
+  let probeResult = await probeVideoFile(objectUrl);
+  let userCancelled = false;
+  const cancelNow = () => { userCancelled = true; if (activeFfmpegCancel) activeFfmpegCancel(); };
+
+  // 1) Hızlı yol: sadece konteyneri değiştir (yeniden kodlama yok)
+  if (!probeResult.ok && !userCancelled) {
+    URL.revokeObjectURL(objectUrl);
+    try {
+      setProgressUi(`"${file.name}" — hızlı format düzeltmesi deneniyor…`, cancelNow);
+      const remuxed = await runFfmpegJob(
+        workingFile, ['-c', 'copy', '-movflags', '+faststart'], 'remux.mp4',
+        (p) => setProgressUi(`"${file.name}" — hızlı format düzeltmesi: %${Math.round(p * 100)}`, cancelNow)
+      );
+      if (remuxed && !userCancelled) {
+        objectUrl = URL.createObjectURL(remuxed);
+        probeResult = await probeVideoFile(objectUrl);
+        if (probeResult.ok) workingFile = remuxed; else URL.revokeObjectURL(objectUrl);
+      }
+    } catch (e) { console.error('remux başarısız:', e); }
+  }
+
+  // 2) Konteyner değil kodeğin kendisi desteklenmiyorsa: tam dönüştürme
+  if (!probeResult.ok && !userCancelled) {
+    try {
+      setProgressUi(`"${file.name}" — video MP4/H.264'e dönüştürülüyor (uzun sürebilir, sekmeyi kapatma)…`, cancelNow);
+      const transcoded = await runFfmpegJob(
+        workingFile,
+        ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-c:a', 'aac', '-b:a', '160k', '-movflags', '+faststart'],
+        'transcode.mp4',
+        (p) => setProgressUi(`"${file.name}" — dönüştürülüyor: %${Math.round(p * 100)} (sekmeyi kapatma)`, cancelNow)
+      );
+      if (transcoded && !userCancelled) {
+        objectUrl = URL.createObjectURL(transcoded);
+        probeResult = await probeVideoFile(objectUrl);
+        if (probeResult.ok) workingFile = transcoded; else URL.revokeObjectURL(objectUrl);
+      }
+    } catch (e) { console.error('dönüştürme başarısız:', e); }
+  }
+
+  clearProgressUi();
+
+  if (userCancelled) { try { URL.revokeObjectURL(objectUrl); } catch (e) {} return { ok: false, cancelled: true }; }
+  if (!probeResult.ok) { try { URL.revokeObjectURL(objectUrl); } catch (e) {} return { ok: false, reason: probeResult.reason }; }
+  return { ok: true, file: workingFile, url: objectUrl };
+}
+
 el('localFileBtn').addEventListener('click', () => {
   if (!state.roomCode) return;
   if (!canCaptureMedia()) {
@@ -365,9 +555,19 @@ el('localFileInput').addEventListener('change', async () => {
     const looksLikeVideo = (file.type && file.type.startsWith('video/')) || VIDEO_NAME_RE.test(file.name);
     if (!looksLikeVideo) { showToast(`"${file.name}" bir video dosyası değil`); continue; }
 
+    showToast(`"${file.name}" kontrol ediliyor…`);
+    const result = await ensurePlayableVideoFile(file);
+    if (!result.ok) {
+      if (result.cancelled) { showToast(`"${file.name}" dönüştürme iptal edildi`); continue; }
+      const msg = unplayableVideoMessage(file.name, result.reason);
+      showToast(msg);
+      el('queueError').textContent = msg;
+      continue;
+    }
+
     const localId = 'l_' + Math.random().toString(36).slice(2, 10);
     const title = file.name.replace(/\.[^.]+$/, '').slice(0, 80) || 'Video';
-    state.localFiles[localId] = { file, url: URL.createObjectURL(file) };
+    state.localFiles[localId] = { file: result.file, url: result.url };
 
     const ref = db.ref(`rooms/${state.roomCode}/queue`).push();
     await ref.set({
@@ -1172,6 +1372,7 @@ function loadPlayerForCurrentItem() {
   stage.classList.add('active');
 
   lastPlaybackSnapshot = { isPlaying: false, position: 0, speed: state.speed, updatedAt: serverTimeNow(), updatedBy: null };
+  blackFrameWarned = false;
 
   if (item.type === 'youtube') {
     state.currentType = 'youtube';
@@ -1369,8 +1570,15 @@ el('qualitySelect').addEventListener('change', () => {
 
 el('videoEl').addEventListener('ended', handleVideoEnded);
 el('videoEl').addEventListener('error', () => {
-  if (!el('videoEl').getAttribute('src')) return; // src temizlenirken tetiklenen hatayı yok say
-  showToast('Video oynatılamadı — format desteklenmiyor olabilir (en uyumlusu MP4 / H.264)');
+  const v = el('videoEl');
+  if (!v.getAttribute('src')) return; // src temizlenirken tetiklenen hatayı yok say
+  const code = v.error && v.error.code;
+  const msgs = {
+    2: 'Video yüklenemedi (ağ hatası) — bağlantını kontrol edip tekrar dene.',
+    3: 'Video çözülemedi — dosya bozuk olabilir.',
+    4: 'Bu video formatı/kodeği tarayıcı tarafından desteklenmiyor (MKV, HEVC/H.265 gibi formatlarda sık görülür). MP4 (H.264 + AAC) formatına dönüştürüp tekrar dene.',
+  };
+  showToast(msgs[code] || 'Video oynatılamadı — format desteklenmiyor olabilir (en uyumlusu MP4 / H.264)');
 });
 
 /* =========================================================
@@ -1868,6 +2076,7 @@ seekRange.addEventListener('change', () => {
 });
 
 /* ilerleme çubuğunu periyodik güncelle — herkes için */
+let blackFrameWarned = false;
 setInterval(() => {
   if (state.seekDragging) return;
   const cur = getCurrentPlayerTime();
@@ -1875,6 +2084,15 @@ setInterval(() => {
   if (dur > 0) { seekRange.max = dur; seekRange.value = cur; }
   el('currentTimeText').textContent = fmtTime(cur);
   el('durationTimeText').textContent = fmtTime(dur);
+
+  // Süre ilerliyor ama görüntü karesi hiç gelmiyorsa (ekran siyah kalıyorsa) uyar
+  if (state.currentType === 'html5' && state.isPlaying && !blackFrameWarned) {
+    const v = el('videoEl');
+    if (cur > 3 && v.videoWidth === 0) {
+      blackFrameWarned = true;
+      showToast('Görüntü gelmiyor gibi görünüyor — video formatı/kodeği desteklenmiyor olabilir (MKV/HEVC yerine MP4/H.264 dene)');
+    }
+  }
 }, 500);
 
 /* =========================================================

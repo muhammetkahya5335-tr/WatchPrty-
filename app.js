@@ -28,6 +28,8 @@ const state = {
   isAdmin: false,       // oda sahibi mi?
   canControl: false,    // oynatma kontrolü var mı? (admin veya yetkilendirilmiş)
   userRef: null,        // kendi users/{uid} düğümümüzün referansı (onDisconnect iptali için)
+  localFiles: {},       // localId -> { file, url }  (cihazımızdan yayınladığımız videolar)
+  isStreamHost: false,  // şu an oynayan video bizim cihazımızdan mı yayınlanıyor?
 };
 
 function serverTimeNow() { return Date.now() + (state.serverOffset || 0); }
@@ -81,13 +83,15 @@ function trackListener(ref, event, handler) {
 function clearAllListeners() {
   state.listeners.forEach(({ ref, event, handler }) => ref.off(event, handler));
   state.listeners = [];
+  stopAllStreaming();
+  revokeLocalFiles();
 }
 
 /* =========================================================
    YETKİ / KONTROL GÖRÜNÜRLÜğÜ
    ========================================================= */
 function updateControlsVisibility() {
-  const can = state.canControl;
+  const can = state.canControl || state.isStreamHost;
   // Play/pause butonu
   el('playPauseBtn').classList.toggle('hidden', !can);
   // Seek çubuğu
@@ -101,6 +105,281 @@ function updateControlsVisibility() {
 
 /* Yetkili kullanıcının kontrolü yoksa seek/play işlemlerini engelle */
 function canWrite() { return state.canControl && !!state.roomCode; }
+
+/* Oynat/durdur/ileri sar yetkisi: yayını izleyenlerde kapalı, yayıncıda açık */
+function canControlPlayback() {
+  if (!state.roomCode) return false;
+  if (state.currentType === 'stream') return false;   // izleyici: kontrol yayıncıda
+  if (state.isStreamHost) return true;                // kendi dosyasını yayınlayan
+  return state.canControl;
+}
+
+/* =========================================================
+   CANLI YAYIN — cihazındaki videoyu odaya yayınla (WebRTC)
+   Video hiçbir sunucuya yüklenmez. Yayıncının tarayıcısı videoyu
+   oynatır, görüntüyü doğrudan izleyicilere aktarır. Firebase sadece
+   bağlantı kurulumu (sinyalleşme) için kullanılır: rooms/{kod}/rtc/
+   ========================================================= */
+const STREAM_MAX_KBPS = 3000;   // izleyici başına en fazla video bit hızı (yayıncının yükleme hızını korur)
+const rtc = {
+  role: null,          // 'host' | 'viewer' | null
+  key: null,           // yayındaki kuyruk öğesinin anahtarı
+  sid: null,           // izleyici oturum kimliği
+  ready: null,         // yayıncı: yakalanan MediaStream sözü
+  peers: {},           // yayıncı: sid -> { pc, listeners }
+  viewerPc: null,
+  remoteStream: null,
+  listeners: [],
+  timeout: null,
+};
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function rtcConfig() {
+  const servers = (typeof ICE_SERVERS !== 'undefined' && Array.isArray(ICE_SERVERS) && ICE_SERVERS.length)
+    ? ICE_SERVERS : [{ urls: 'stun:stun.l.google.com:19302' }];
+  return { iceServers: servers };
+}
+function canCaptureMedia() {
+  return !!(HTMLMediaElement.prototype.captureStream || HTMLMediaElement.prototype.mozCaptureStream);
+}
+function rtcListen(list, ref, event, handler) { ref.on(event, handler); list.push({ ref, event, handler }); }
+function rtcUnlisten(list) { list.forEach(({ ref, event, handler }) => ref.off(event, handler)); list.length = 0; }
+function plainJson(o) { return JSON.parse(JSON.stringify(o)); }   // Firebase undefined kabul etmez
+function addCand(pc, cand) {
+  if (!cand) return;
+  if (pc.remoteDescription) pc.addIceCandidate(cand).catch(() => {});
+  else (pc._pending = pc._pending || []).push(cand);
+}
+function flushCands(pc) {
+  (pc._pending || []).forEach((c) => pc.addIceCandidate(c).catch(() => {}));
+  pc._pending = [];
+}
+function limitVideoBitrate(pc) {
+  pc.getSenders().forEach((s) => {
+    if (!s.track || s.track.kind !== 'video') return;
+    try {
+      const p = s.getParameters();
+      if (!p.encodings || !p.encodings.length) p.encodings = [{}];
+      p.encodings[0].maxBitrate = STREAM_MAX_KBPS * 1000;
+      s.setParameters(p).catch(() => {});
+    } catch (e) {}
+  });
+}
+
+/* ---------- Yayıncı tarafı ---------- */
+function startHostBroadcast(key) {
+  if (!canCaptureMedia()) {
+    showToast('Bu tarayıcı video yayınlayamıyor (Chrome, Edge ya da Firefox kullan) — sadece sen izleyebilirsin');
+    return;
+  }
+  const v = el('videoEl');
+  rtc.role = 'host';
+  rtc.key = key;
+  rtc.ready = new Promise((resolve) => {
+    const capture = async () => {
+      if (rtc.key !== key) { resolve(null); return; }
+      try {
+        const cap = v.captureStream ? v.captureStream() : v.mozCaptureStream();
+        for (let i = 0; i < 25 && cap.getTracks().length === 0; i++) await sleep(150);
+        if (rtc.key !== key) { resolve(null); return; }
+        resolve(cap.getTracks().length ? cap : null);
+      } catch (e) { console.error(e); resolve(null); }
+    };
+    if (v.readyState >= 2) capture();
+    else v.addEventListener('loadeddata', capture, { once: true });
+  });
+  rtc.ready.then((cap) => { if (!cap && rtc.key === key) showToast('Video yayına hazırlanamadı'); });
+
+  const base = db.ref(`rooms/${state.roomCode}/rtc/${key}`);
+  rtcListen(rtc.listeners, base, 'child_added', (s) => hostAcceptViewer(key, s.key));
+  rtcListen(rtc.listeners, base, 'child_removed', (s) => hostDropViewer(s.key));
+}
+
+async function hostAcceptViewer(key, sid) {
+  if (rtc.role !== 'host' || rtc.key !== key) return;
+  const stream = await rtc.ready;
+  if (!stream || rtc.role !== 'host' || rtc.key !== key) return;
+
+  const vref = db.ref(`rooms/${state.roomCode}/rtc/${key}/${sid}`);
+  // Bu arada izleyici ayrıldıysa boşuna teklif yazma
+  try { if (!(await vref.child('join').get()).exists()) return; } catch (e) { return; }
+  if (rtc.role !== 'host' || rtc.key !== key) return;
+
+  hostDropViewer(sid);
+  const pc = new RTCPeerConnection(rtcConfig());
+  const peer = { pc, listeners: [] };
+  rtc.peers[sid] = peer;
+
+  stream.getTracks().forEach((t) => {
+    if (t.kind === 'video') { try { t.contentHint = 'motion'; } catch (e) {} }
+    pc.addTrack(t, stream);
+  });
+  pc.onicecandidate = (e) => { if (e.candidate) vref.child('hostCand').push(plainJson(e.candidate)); };
+
+  try {
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    limitVideoBitrate(pc);
+    await vref.child('offer').set({ type: offer.type, sdp: offer.sdp });
+  } catch (e) { console.error('Teklif oluşturulamadı:', e); return; }
+
+  rtcListen(peer.listeners, vref.child('answer'), 'value', async (s) => {
+    const ans = s.val();
+    if (!ans || pc.remoteDescription || pc.signalingState === 'closed') return;
+    try { await pc.setRemoteDescription(ans); flushCands(pc); } catch (e) { console.error(e); }
+  });
+  rtcListen(peer.listeners, vref.child('viewerCand'), 'child_added', (s) => addCand(pc, s.val()));
+}
+
+function hostDropViewer(sid) {
+  const peer = rtc.peers[sid];
+  if (!peer) return;
+  rtcUnlisten(peer.listeners);
+  try { peer.pc.close(); } catch (e) {}
+  delete rtc.peers[sid];
+}
+
+/* ---------- İzleyici tarafı ---------- */
+async function startViewerStream(key) {
+  rtc.role = 'viewer';
+  rtc.key = key;
+  rtc.sid = state.uid + '_' + Math.random().toString(36).slice(2, 6);
+  rtc.remoteStream = new MediaStream();
+
+  const v = el('videoEl');
+  const vref = db.ref(`rooms/${state.roomCode}/rtc/${key}/${rtc.sid}`);
+  const pc = new RTCPeerConnection(rtcConfig());
+  rtc.viewerPc = pc;
+
+  pc.ontrack = (e) => {
+    rtc.remoteStream.addTrack(e.track);
+    if (v.srcObject !== rtc.remoteStream) v.srcObject = rtc.remoteStream;
+    v.play().catch((err) => {
+      // Sadece tarayıcı sesli otomatik oynatmayı engellediyse sessiz başlat, dokununca aç
+      if (!err || err.name !== 'NotAllowedError') return;
+      v.muted = true;
+      v.play().catch(() => {});
+      showToast('Ses kapalı — açmak için ekrana dokun');
+    });
+  };
+  pc.onicecandidate = (e) => { if (e.candidate) vref.child('viewerCand').push(plainJson(e.candidate)); };
+  pc.onconnectionstatechange = () => {
+    if (pc !== rtc.viewerPc) return;
+    if (pc.connectionState === 'connected') clearTimeout(rtc.timeout);
+    if (pc.connectionState === 'failed') {
+      showToast('Bağlantı kurulamadı — 🔄 ile tekrar dene (bazı ağlar doğrudan bağlantıya izin vermez)');
+    }
+  };
+
+  rtcListen(rtc.listeners, vref.child('offer'), 'value', async (s) => {
+    const offer = s.val();
+    if (!offer || pc.remoteDescription || pc !== rtc.viewerPc) return;
+    try {
+      await pc.setRemoteDescription(offer);
+      flushCands(pc);
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      await vref.child('answer').set({ type: answer.type, sdp: answer.sdp });
+    } catch (e) { console.error('Yanıt oluşturulamadı:', e); }
+  });
+  rtcListen(rtc.listeners, vref.child('hostCand'), 'child_added', (s) => addCand(pc, s.val()));
+
+  try {
+    vref.onDisconnect().remove();
+    await vref.child('join').set(firebase.database.ServerValue.TIMESTAMP);
+  } catch (e) { console.error(e); }
+
+  clearTimeout(rtc.timeout);
+  rtc.timeout = setTimeout(() => {
+    if (pc === rtc.viewerPc && pc.connectionState !== 'connected') {
+      showToast('Yayıncıya bağlanılamadı — yayıncı odada olmayabilir ya da ağ engelliyor');
+    }
+  }, 20000);
+}
+
+function restartViewerStream() {
+  const key = state.currentItemId;
+  if (!key || state.currentType !== 'stream') return;
+  stopAllStreaming();
+  startViewerStream(key);
+}
+
+/* ---------- Temizlik ---------- */
+function stopAllStreaming() {
+  clearTimeout(rtc.timeout);
+  rtcUnlisten(rtc.listeners);
+  Object.keys(rtc.peers).forEach(hostDropViewer);
+  if (rtc.viewerPc) { try { rtc.viewerPc.close(); } catch (e) {} rtc.viewerPc = null; }
+  rtc.remoteStream = null;
+
+  const v = document.getElementById('videoEl');
+  if (v && v.srcObject) { v.srcObject = null; }
+  if (v) v.muted = false;
+
+  if (state.roomCode && rtc.key) {
+    try {
+      if (rtc.role === 'host') db.ref(`rooms/${state.roomCode}/rtc/${rtc.key}`).remove().catch(() => {});
+      if (rtc.role === 'viewer' && rtc.sid) db.ref(`rooms/${state.roomCode}/rtc/${rtc.key}/${rtc.sid}`).remove().catch(() => {});
+    } catch (e) {}
+  }
+  rtc.role = null; rtc.key = null; rtc.sid = null; rtc.ready = null;
+
+  if (state.isStreamHost) { state.isStreamHost = false; updateControlsVisibility(); }
+}
+
+function revokeLocalFiles() {
+  Object.values(state.localFiles).forEach((f) => { try { URL.revokeObjectURL(f.url); } catch (e) {} });
+  state.localFiles = {};
+}
+
+// İlk dokunuşta sesi aç (otomatik oynatma sessize düştüyse)
+document.addEventListener('click', () => {
+  const v = el('videoEl');
+  if (rtc.role === 'viewer' && v.srcObject && v.muted) { v.muted = false; v.play().catch(() => {}); }
+}, true);
+
+// Yayın sürerken sekme kapatılırsa uyar
+window.addEventListener('beforeunload', (e) => {
+  if (rtc.role === 'host' && Object.keys(rtc.peers).length) { e.preventDefault(); e.returnValue = ''; }
+});
+
+/* ---------- Dosya seçimi ---------- */
+const VIDEO_NAME_RE = /\.(mp4|m4v|webm|mov|mkv|ogv)$/i;
+
+el('localFileBtn').addEventListener('click', () => {
+  if (!state.roomCode) return;
+  if (!canCaptureMedia()) {
+    showToast('Bu tarayıcı video yayınlayamıyor — Chrome, Edge ya da Firefox kullan (telefonda Chrome olur)');
+    return;
+  }
+  el('localFileInput').click();
+});
+
+el('localFileInput').addEventListener('change', async () => {
+  const files = Array.from(el('localFileInput').files || []);
+  el('localFileInput').value = '';
+  if (!files.length || !state.roomCode) return;
+  el('queueError').textContent = '';
+
+  for (const file of files) {
+    const looksLikeVideo = (file.type && file.type.startsWith('video/')) || VIDEO_NAME_RE.test(file.name);
+    if (!looksLikeVideo) { showToast(`"${file.name}" bir video dosyası değil`); continue; }
+
+    const localId = 'l_' + Math.random().toString(36).slice(2, 10);
+    const title = file.name.replace(/\.[^.]+$/, '').slice(0, 80) || 'Video';
+    state.localFiles[localId] = { file, url: URL.createObjectURL(file) };
+
+    const ref = db.ref(`rooms/${state.roomCode}/queue`).push();
+    await ref.set({
+      type: 'stream', refId: localId, localId,
+      hostUid: state.uid, hostName: state.name,
+      title, addedBy: state.name,
+      addedAt: firebase.database.ServerValue.TIMESTAMP,
+    });
+    if (!state.currentItemId) await setCurrentItem(ref.key, { force: true });
+    pushSystemMessage(`${state.name} listeye "${title}" videosunu ekledi (canlı yayın)`);
+  }
+});
 
 /* =========================================================
    LINK ALGILAMA
@@ -641,7 +920,7 @@ function renderQueue() {
     list.innerHTML = '<li class="queue-empty">Liste boş — yukarıdan bir link ekle</li>';
     return;
   }
-  const typeIcon = { youtube: '▶', drive: '⛁', video: '🎬', kick: '🟣', twitch: '💜', twitch_vod: '💜', vimeo: '🎞' };
+  const typeIcon = { youtube: '▶', drive: '⛁', video: '🎬', stream: '📡', kick: '🟣', twitch: '💜', twitch_vod: '💜', vimeo: '🎞' };
   state.queueOrder.forEach((key) => {
     const item = state.queueCache[key];
     const li = document.createElement('li');
@@ -755,8 +1034,8 @@ async function setCurrentItem(key, opts = {}) {
 }
 
 async function advanceQueue() {
-  // Sadece yetkili kullanıcılar (admin veya canControl) kuyruğu ilerletebilir
-  if (!canWrite()) return;
+  // Sadece yetkili kullanıcılar (admin veya canControl) ya da videoyu yayınlayan kişi kuyruğu ilerletebilir
+  if (!canWrite() && !state.isStreamHost) return;
   const finishedKey = state.currentItemId;
   const finishedItem = finishedKey ? state.queueCache[finishedKey] : null;
   const idx = state.queueOrder.indexOf(finishedKey);
@@ -778,7 +1057,9 @@ async function advanceQueue() {
   if (finishedKey && finishedItem) {
     db.ref(`rooms/${state.roomCode}/history`).push({
       type: finishedItem.type, refId: finishedItem.refId, title: finishedItem.title,
-      addedBy: finishedItem.addedBy || null, watchedAt: firebase.database.ServerValue.TIMESTAMP,
+      addedBy: finishedItem.addedBy || null,
+      localId: finishedItem.localId || null, hostUid: finishedItem.hostUid || null, hostName: finishedItem.hostName || null,
+      watchedAt: firebase.database.ServerValue.TIMESTAMP,
     });
     db.ref(`rooms/${state.roomCode}/queue/${finishedKey}`).remove();
   }
@@ -813,7 +1094,7 @@ function renderHistory() {
     list.innerHTML = '<li class="queue-empty">Henüz izlenmiş bir şey yok</li>';
     return;
   }
-  const typeIcon = { youtube: '▶', drive: '⛁', video: '🎬', kick: '🟣', twitch: '💜', twitch_vod: '💜', vimeo: '🎞' };
+  const typeIcon = { youtube: '▶', drive: '⛁', video: '🎬', stream: '📡', kick: '🟣', twitch: '💜', twitch_vod: '💜', vimeo: '🎞' };
   state.historyOrder.forEach((key) => {
     const item = state.historyCache[key];
     const li = document.createElement('li');
@@ -832,9 +1113,15 @@ function renderHistory() {
 }
 
 async function readdFromHistory(item) {
+  if (item.type === 'stream') {
+    // Yayın videosu sadece dosyanın sahibi tarafından (sekmesi açıkken) tekrar eklenebilir
+    if (item.hostUid !== state.uid) { showToast('Bu videoyu sadece yayınlayan kişi tekrar ekleyebilir'); return; }
+    if (!state.localFiles[item.localId]) { showToast('Dosya artık yok — videoyu 📁 ile yeniden seç'); return; }
+  }
   const ref = db.ref(`rooms/${state.roomCode}/queue`).push();
   await ref.set({
     type: item.type, refId: item.refId, title: item.title,
+    localId: item.localId || null, hostUid: item.hostUid || null, hostName: item.hostName || null,
     addedBy: state.name, addedAt: firebase.database.ServerValue.TIMESTAMP,
   });
   if (!state.currentItemId) await setCurrentItem(ref.key, { force: true });
@@ -860,6 +1147,7 @@ function loadPlayerForCurrentItem() {
   const videoEl = el('videoEl');
 
   hideEndCountdown();
+  stopAllStreaming();
 
   if (!item) {
     // currentItemId zaten ayarlı ama kuyruk verisi henüz senkronize olmamış olabilir
@@ -921,6 +1209,47 @@ function loadPlayerForCurrentItem() {
 
     loadIframePlayer(item);
 
+  } else if (item.type === 'stream') {
+    const isHost = item.hostUid === state.uid;
+    el('liveHost').style.display = 'none';
+    el('liveHost').innerHTML = '';
+    ytHost.style.display = 'none';
+    videoEl.style.display = 'block';
+    el('qualitySelect').classList.add('hidden');
+    el('speedSelect').classList.add('hidden');
+    if (state.ytPlayer && state.ytPlayer.pauseVideo) state.ytPlayer.pauseVideo();
+    const pipOk = !!(document.pictureInPictureEnabled || videoEl.webkitSupportsPresentationMode);
+    el('pipBtn').classList.toggle('hidden', !pipOk);
+
+    if (isHost) {
+      const local = state.localFiles[item.localId];
+      if (!local) {
+        // Sayfa yenilendiyse dosya referansı kaybolur
+        stage.classList.remove('active');
+        empty.classList.remove('hidden');
+        showToast('Sayfa yenilendiği için dosya kayboldu — videoyu 📁 ile yeniden seç');
+        return;
+      }
+      state.currentType = 'html5';
+      state.isStreamHost = true;
+      updateControlsVisibility();
+      setLiveBadge(false);
+      el('seekRange').disabled = false;
+      el('seekRange').style.opacity = '1';
+      videoEl.removeAttribute('src');
+      videoEl.src = local.url;
+      videoEl.load();
+      startHostBroadcast(state.currentItemId);
+    } else {
+      state.currentType = 'stream';
+      videoEl.pause();
+      videoEl.removeAttribute('src');
+      setLiveBadge(true, `📡 ${item.hostName || 'Yayıncı'} yayınlıyor`);
+      el('seekRange').disabled = true;
+      el('seekRange').style.opacity = '.3';
+      startViewerStream(state.currentItemId);
+    }
+
   } else {
     state.currentType = 'html5';
     el('liveHost').style.display = 'none';
@@ -968,7 +1297,7 @@ function loadIframePlayer(item) {
   host.appendChild(iframe);
 }
 
-function setLiveBadge(show) {
+function setLiveBadge(show, text) {
   let badge = document.getElementById('liveBadge');
   if (show) {
     if (!badge) {
@@ -978,6 +1307,7 @@ function setLiveBadge(show) {
       badge.textContent = '🔴 CANLI';
       document.querySelector('.control-bar').prepend(badge);
     }
+    badge.textContent = text || '🔴 CANLI';
     badge.style.display = '';
     el('playPauseBtn').style.display    = 'none';
     el('currentTimeText').style.display = 'none';
@@ -985,7 +1315,7 @@ function setLiveBadge(show) {
   } else {
     if (badge) badge.style.display = 'none';
     // Sadece yetkililere play butonu göster
-    el('playPauseBtn').style.display    = state.canControl ? '' : 'none';
+    el('playPauseBtn').style.display    = (state.canControl || state.isStreamHost) ? '' : 'none';
     el('currentTimeText').style.display = '';
     el('durationTimeText').style.display = '';
   }
@@ -1038,6 +1368,10 @@ el('qualitySelect').addEventListener('change', () => {
 });
 
 el('videoEl').addEventListener('ended', handleVideoEnded);
+el('videoEl').addEventListener('error', () => {
+  if (!el('videoEl').getAttribute('src')) return; // src temizlenirken tetiklenen hatayı yok say
+  showToast('Video oynatılamadı — format desteklenmiyor olabilir (en uyumlusu MP4 / H.264)');
+});
 
 /* =========================================================
    OTOMATİK PICTURE-IN-PICTURE
@@ -1143,7 +1477,7 @@ el('pipBtn').addEventListener('click', async () => {
 
 /* --- Süre metnine tıklayınca manuel zaman girişi (sadece yetkililere) --- */
 el('controlBar').addEventListener('click', (e) => {
-  if (!canWrite()) return; // yetkisi yoksa zaman girişi açılmasın
+  if (!canControlPlayback()) return; // yetkisi yoksa zaman girişi açılmasın
   const timeEl = e.target.closest('#currentTimeText');
   if (!timeEl || timeEl.dataset.editing) return;
   timeEl.dataset.editing = '1';
@@ -1423,7 +1757,7 @@ function hideEndCountdown() {
 }
 
 el('countdownSkipBtn').addEventListener('click', () => {
-  if (!canWrite()) { hideEndCountdown(); return; } // yetkisiz kullanıcı atlayamaz
+  if (!canWrite() && !state.isStreamHost) { hideEndCountdown(); return; } // yetkisiz kullanıcı atlayamaz
   hideEndCountdown();
   advanceQueue();
 });
@@ -1477,6 +1811,7 @@ function writePlayback(isPlaying, position) {
 /* --- "Beni Yakala": anlık senkronize et (herkes kullanabilir) --- */
 el('forceSyncBtn').addEventListener('click', async () => {
   if (!state.roomCode) return;
+  if (state.currentType === 'stream') { showToast('Yayına yeniden bağlanılıyor…'); restartViewerStream(); return; }
   showToast('Senkronize ediliyor…');
   try {
     const snap = await db.ref(`rooms/${state.roomCode}/playback`).get();
@@ -1514,17 +1849,17 @@ el('speedSelect').addEventListener('change', () => {
 
 /* Play/Pause: sadece yetkililere */
 el('playPauseBtn').addEventListener('click', () => {
-  if (!canWrite()) return;
+  if (!canControlPlayback()) return;
   if (state.isPlaying) { pauseLocal(); writePlayback(false, getCurrentPlayerTime()); }
   else { playLocal(); writePlayback(true, getCurrentPlayerTime()); }
 });
 
 /* Seek: sadece yetkililere */
 const seekRange = el('seekRange');
-seekRange.addEventListener('mousedown', () => { if (canWrite()) state.seekDragging = true; });
-seekRange.addEventListener('touchstart', () => { if (canWrite()) state.seekDragging = true; });
+seekRange.addEventListener('mousedown', () => { if (canControlPlayback()) state.seekDragging = true; });
+seekRange.addEventListener('touchstart', () => { if (canControlPlayback()) state.seekDragging = true; });
 seekRange.addEventListener('change', () => {
-  if (!canWrite()) return;
+  if (!canControlPlayback()) return;
   const t = parseFloat(seekRange.value);
   seekLocal(t);
   writePlayback(state.isPlaying, t);

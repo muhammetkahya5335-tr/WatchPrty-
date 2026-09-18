@@ -91,6 +91,12 @@ body{
 .code-input{ font-family:var(--font-mono); letter-spacing:3px; text-transform:uppercase; text-align:center; font-size:18px; }
 
 .error-text{ color:var(--rose); font-size:12.5px; min-height:16px; margin:8px 2px 0; }
+.error-text.progress-text{ color:var(--accent); display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+.inline-cancel-btn{
+  background:transparent; border:1px solid var(--border); color:var(--text-muted);
+  border-radius:6px; padding:2px 10px; font-size:12px; cursor:pointer;
+}
+.inline-cancel-btn:hover{ border-color:var(--accent); color:var(--text); }
 .loading-text{ color:var(--text-muted); font-size:13px; text-align:center; margin-top:14px; }
 
 .choice-row{ display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:22px; }

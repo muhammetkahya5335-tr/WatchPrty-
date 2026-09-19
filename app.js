@@ -623,7 +623,49 @@ function parseLink(raw) {
   const drive = raw.match(/drive\.google\.com\/(?:file\/d\/|open\?id=)([A-Za-z0-9_-]+)/);
   if (drive) return { type: 'drive', refId: drive[1], title: 'Drive videosu' };
 
+  // Dropbox paylaşım linki → doğrudan dosya linkine çevir (dl=1)
+  if (host === 'dropbox.com') {
+    let direct = raw.replace(/([?&])dl=\d/, '$1dl=1');
+    if (!/[?&]dl=1/.test(direct)) direct += (direct.includes('?') ? '&' : '?') + 'dl=1';
+    const name = decodeURIComponent((url.pathname.split('/').pop() || 'Video').replace(/\.[^.]+$/, ''));
+    return { type: 'video', refId: direct, title: name || 'Dropbox videosu' };
+  }
+
+  // Pixeldrain paylaşım linki → doğrudan dosya API linkine çevir
+  if (host === 'pixeldrain.com') {
+    const pd = url.pathname.match(/\/u\/([A-Za-z0-9]+)/);
+    if (pd) return { type: 'video', refId: `https://pixeldrain.com/api/file/${pd[1]}`, title: 'Pixeldrain videosu' };
+  }
+
+  // MediaFire paylaşım sayfası doğrudan bir video dosyası değil, "İndir" düğmesi
+  // olan bir HTML sayfası — gerçek dosya linkini almak için sayfayı okumamız
+  // (async) gerekiyor, bu yüzden ayrı bir tip olarak işaretleyip çözümlemeyi
+  // addLinkToQueue() içinde yapıyoruz.
+  if (host === 'mediafire.com') {
+    return { type: 'mediafire', refId: raw, title: 'MediaFire videosu' };
+  }
+
   return { type: 'video', refId: raw, title: raw.split('/').pop().slice(0, 60) || 'Video' };
+}
+
+/* MediaFire paylaşım sayfasındaki gerçek indirme linkini bulur.
+   MediaFire sayfayı CORS izni olmadan servis ettiği için tarayıcıdan
+   doğrudan fetch edilemiyor — açık bir CORS proxy'si üzerinden okuyoruz.
+   Proxy zaman zaman yanıt vermeyebilir; başarısız olursa kullanıcıya
+   "İndir" düğmesine tıklayıp çıkan asıl bağlantıyı yapıştırmasını öneririz. */
+async function resolveMediaFireLink(shareUrl) {
+  const proxied = 'https://api.allorigins.win/raw?url=' + encodeURIComponent(shareUrl);
+  const res = await fetch(proxied);
+  if (!res.ok) throw new Error('sayfa alınamadı');
+  const html = await res.text();
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  const btn = doc.getElementById('downloadButton');
+  const href = btn && btn.getAttribute('href');
+  if (!href || !/^https?:\/\//.test(href)) throw new Error('indirme bağlantısı bulunamadı');
+  let title = 'MediaFire videosu';
+  const nameEl = doc.querySelector('.dl-btn-label') || doc.querySelector('.filename');
+  if (nameEl && nameEl.textContent.trim()) title = nameEl.textContent.trim().slice(0, 80);
+  return { url: href, title };
 }
 
 function driveStreamUrl(fileId) {
@@ -1029,6 +1071,20 @@ async function addLinkToQueue() {
     input.value = '';
     await addYoutubePlaylistToQueue(parsed.refId);
     return;
+  }
+
+  if (parsed.type === 'mediafire') {
+    showToast('MediaFire linki çözümleniyor…');
+    try {
+      const resolved = await resolveMediaFireLink(parsed.refId);
+      parsed.type = 'video';
+      parsed.refId = resolved.url;
+      parsed.title = resolved.title;
+    } catch (e) {
+      console.error('MediaFire çözümlenemedi:', e);
+      el('queueError').textContent = 'MediaFire linki çözümlenemedi. Sayfayı açıp "İndir" düğmesine sağ tıklayıp "Bağlantı adresini kopyala" ile çıkan asıl indirme linkini yapıştırmayı dene.';
+      return;
+    }
   }
 
   const ref = db.ref(`rooms/${state.roomCode}/queue`).push();
